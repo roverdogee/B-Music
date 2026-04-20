@@ -114,6 +114,7 @@ struct ContentView: View {
                     }
             }
             .presentationDetents([.medium, .large])
+            .presentationBackground(Color.clear)
         }
         .sheet(isPresented: $viewModel.showPlayer) {
             PlayerScreen(viewModel: viewModel)
@@ -244,14 +245,24 @@ private struct SearchScreen: View {
                 .disabled(viewModel.searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || viewModel.isSearching)
             }
 
-            Section(viewModel.results.isEmpty ? "推荐关键词" : "结果") {
+            Section {
                 if viewModel.results.isEmpty {
-                    ForEach(["周杰伦", "邓紫棋", "林俊杰", "洛天依"], id: \.self) { keyword in
-                        Button(keyword) {
-                            viewModel.searchText = keyword
-                            Task { await viewModel.search(reset: true) }
+                    RecommendationCloudView(recommendations: viewModel.displayRecommendations) { keyword in
+                        viewModel.searchText = keyword
+                        Task { await viewModel.search(reset: true) }
+                    }
+
+                    Button {
+                        viewModel.shuffleRecommendations()
+                        Task { await viewModel.refreshRecommendedKeywords(force: true) }
+                    } label: {
+                        if viewModel.isLoadingRecommendedKeywords {
+                            ProgressView()
+                        } else {
+                            Label("换一换", systemImage: "arrow.triangle.2.circlepath")
                         }
                     }
+                    .disabled(viewModel.isLoadingRecommendedKeywords)
                 } else {
                     ForEach(viewModel.results) { item in
                         MusicRow(viewModel: viewModel, item: item)
@@ -278,9 +289,14 @@ private struct SearchScreen: View {
                         }
                     }
                 }
+            } header: {
+                Text(viewModel.results.isEmpty ? "推荐关键词" : "结果")
             }
         }
         .listStyle(.insetGrouped)
+        .task {
+            await viewModel.refreshRecommendedKeywords()
+        }
     }
 }
 
@@ -328,6 +344,121 @@ private struct QuickSearchBar: View {
         .onAppear {
             isFocused = true
         }
+    }
+}
+
+private struct RecommendationCloudView: View {
+    let recommendations: [BMusicRecommendation]
+    let select: (String) -> Void
+
+    var body: some View {
+        FlowLayout(spacing: 9, rowSpacing: 10) {
+            ForEach(recommendations) { recommendation in
+                Button {
+                    select(recommendation.keyword)
+                } label: {
+                    Text(recommendation.keyword)
+                        .font(.system(size: fontSize(for: recommendation), weight: fontWeight(for: recommendation)))
+                        .lineLimit(1)
+                        .foregroundStyle(styleColor(for: recommendation).opacity(0.92))
+                        .padding(.horizontal, horizontalPadding(for: recommendation))
+                        .padding(.vertical, verticalPadding(for: recommendation))
+                        .background(styleColor(for: recommendation).opacity(0.12), in: Capsule())
+                        .background(.ultraThinMaterial, in: Capsule())
+                        .rotationEffect(.degrees(rotation(for: recommendation)))
+                        .offset(y: yOffset(for: recommendation))
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.vertical, 10)
+    }
+
+    private func fontSize(for recommendation: BMusicRecommendation) -> CGFloat {
+        let scores = recommendations.map(\.score)
+        let minScore = scores.min() ?? recommendation.score
+        let maxScore = scores.max() ?? recommendation.score
+        guard maxScore > minScore else {
+            return 18
+        }
+        let ratio = CGFloat(recommendation.score - minScore) / CGFloat(maxScore - minScore)
+        return 14 + ratio * 18
+    }
+
+    private func fontWeight(for recommendation: BMusicRecommendation) -> Font.Weight {
+        recommendation.score >= (recommendations.map(\.score).max() ?? recommendation.score) - 1 ? .semibold : .regular
+    }
+
+    private func horizontalPadding(for recommendation: BMusicRecommendation) -> CGFloat {
+        fontSize(for: recommendation) > 24 ? 16 : 11
+    }
+
+    private func verticalPadding(for recommendation: BMusicRecommendation) -> CGFloat {
+        fontSize(for: recommendation) > 24 ? 9 : 7
+    }
+
+    private func styleColor(for recommendation: BMusicRecommendation) -> Color {
+        let colors: [Color] = [.pink, .teal, .indigo, .orange, .green, .cyan]
+        return colors[abs(recommendation.keyword.stableHash) % colors.count]
+    }
+
+    private func rotation(for recommendation: BMusicRecommendation) -> Double {
+        Double((abs(recommendation.keyword.stableHash) % 9) - 4) * 0.8
+    }
+
+    private func yOffset(for recommendation: BMusicRecommendation) -> CGFloat {
+        CGFloat((abs(recommendation.keyword.stableHash / 7) % 7) - 3)
+    }
+}
+
+private struct FlowLayout: Layout {
+    var spacing: CGFloat = 8
+    var rowSpacing: CGFloat = 8
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let layout = computeLayout(proposal: proposal, subviews: subviews)
+        return layout.size
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let layout = computeLayout(proposal: proposal, subviews: subviews)
+        for (index, origin) in layout.origins.enumerated() {
+            subviews[index].place(
+                at: CGPoint(x: bounds.minX + origin.x, y: bounds.minY + origin.y),
+                proposal: ProposedViewSize(layout.sizes[index])
+            )
+        }
+    }
+
+    private func computeLayout(proposal: ProposedViewSize, subviews: Subviews) -> (size: CGSize, origins: [CGPoint], sizes: [CGSize]) {
+        let maxWidth = proposal.width ?? 320
+        var origins: [CGPoint] = []
+        var sizes: [CGSize] = []
+        var x: CGFloat = 0
+        var y: CGFloat = 0
+        var rowHeight: CGFloat = 0
+        var usedWidth: CGFloat = 0
+
+        for subview in subviews {
+            let size = subview.sizeThatFits(.unspecified)
+            if x > 0, x + size.width > maxWidth {
+                x = 0
+                y += rowHeight + rowSpacing
+                rowHeight = 0
+            }
+
+            origins.append(CGPoint(x: x, y: y))
+            sizes.append(size)
+            x += size.width + spacing
+            rowHeight = max(rowHeight, size.height)
+            usedWidth = max(usedWidth, x - spacing)
+        }
+
+        return (
+            CGSize(width: min(maxWidth, usedWidth), height: y + rowHeight),
+            origins,
+            sizes
+        )
     }
 }
 
@@ -463,7 +594,7 @@ private struct LibraryHomeContent: View {
         if !viewModel.recentlyPlayed.isEmpty {
             Section("最近播放") {
                 ForEach(viewModel.recentlyPlayed) { item in
-                    MusicRow(viewModel: viewModel, item: item)
+                    MusicRow(viewModel: viewModel, item: item, queueContext: viewModel.recentlyPlayed)
                 }
                 .onDelete { offsets in
                     viewModel.removeRecentlyPlayed(at: offsets)
@@ -590,7 +721,7 @@ private struct PlaylistDetailScreen: View {
                     ContentUnavailableView("列表为空", systemImage: "music.note.list", description: Text("在歌曲右侧点加号，选择加入这个列表。"))
                 } else {
                     ForEach(playlist.items) { item in
-                        MusicRow(viewModel: viewModel, item: item)
+                        MusicRow(viewModel: viewModel, item: item, queueContext: playlist.items)
                     }
                     .onDelete { offsets in
                         viewModel.removeItems(fromPlaylist: playlist.id, at: offsets)
@@ -650,7 +781,7 @@ private struct FavoritePlaylistDetailScreen: View {
                 ContentUnavailableView("列表为空", systemImage: "heart", description: Text("在搜索结果里点心形按钮，就会加入这里。"))
             } else {
                 ForEach(visibleItems) { item in
-                    MusicRow(viewModel: viewModel, item: item)
+                    MusicRow(viewModel: viewModel, item: item, queueContext: visibleItems)
                 }
                 .onDelete { offsets in
                     let removedItems = offsets.compactMap { visibleItems.indices.contains($0) ? visibleItems[$0] : nil }
@@ -695,70 +826,93 @@ private struct PlaylistPickerScreen: View {
     @State private var newPlaylistName = ""
 
     var body: some View {
-        List {
-            if let item = viewModel.playlistPickerItem {
-                Section {
-                    VideoRow(item: item, isCurrent: viewModel.currentItem?.id == item.id, showsPlayButton: false, showsActionButton: false) {
-                        Task { await viewModel.play(item) }
-                    } addAction: {
-                        viewModel.showPlaylistPicker = false
-                    }
-                }
-            }
+        ZStack {
+            PlayerDynamicBackground(item: viewModel.playlistPickerItem ?? viewModel.currentItem)
 
-            Section("新建") {
-                HStack {
-                    TextField("播放列表名称", text: $newPlaylistName)
-                    Button("创建并加入") {
-                        viewModel.createPlaylist(named: newPlaylistName, adding: viewModel.playlistPickerItem)
-                        newPlaylistName = ""
-                        viewModel.showPlaylistPicker = false
-                    }
-                    .disabled(newPlaylistName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                }
-            }
-
-            Section("已有播放列表") {
-                Button {
-                    if let item = viewModel.playlistPickerItem {
-                        viewModel.addFavorite(item)
-                    }
-                    viewModel.showPlaylistPicker = false
-                } label: {
-                    HStack {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text("我的收藏")
-                            Text("\(viewModel.favorites.count) 首")
-                                .font(.footnote)
-                                .foregroundStyle(.secondary)
+            List {
+                if let item = viewModel.playlistPickerItem {
+                    Section {
+                        VideoRow(item: item, isCurrent: viewModel.currentItem?.id == item.id, showsPlayButton: false, showsActionButton: false) {
+                            Task { await viewModel.play(item) }
+                        } addAction: {
+                            viewModel.showPlaylistPicker = false
                         }
-                        Spacer()
-                        Image(systemName: "heart")
                     }
+                    .listRowBackground(PlaylistPickerRowBackground())
                 }
 
-                ForEach(viewModel.playlists) { playlist in
+                Section("已有播放列表") {
                     Button {
                         if let item = viewModel.playlistPickerItem {
-                            viewModel.add(item, toPlaylist: playlist.id)
+                            viewModel.addFavorite(item)
                         }
                         viewModel.showPlaylistPicker = false
                     } label: {
                         HStack {
                             VStack(alignment: .leading, spacing: 4) {
-                                Text(playlist.name)
-                                Text("\(playlist.items.count) 首")
+                                Text("我的收藏")
+                                Text("\(viewModel.favorites.count) 首")
                                     .font(.footnote)
-                                    .foregroundStyle(.secondary)
+                                    .foregroundStyle(.primary.opacity(0.72))
                             }
                             Spacer()
-                            Image(systemName: "plus")
+                            Image(systemName: "heart")
                         }
+                        .foregroundStyle(.primary)
+                    }
+                    .buttonStyle(.plain)
+                    .listRowBackground(PlaylistPickerRowBackground())
+
+                    ForEach(viewModel.playlists) { playlist in
+                        Button {
+                            if let item = viewModel.playlistPickerItem {
+                                viewModel.add(item, toPlaylist: playlist.id)
+                            }
+                            viewModel.showPlaylistPicker = false
+                        } label: {
+                            HStack {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(playlist.name)
+                                    Text("\(playlist.items.count) 首")
+                                        .font(.footnote)
+                                        .foregroundStyle(.primary.opacity(0.72))
+                                }
+                                Spacer()
+                                Image(systemName: "plus")
+                            }
+                            .foregroundStyle(.primary)
+                        }
+                        .buttonStyle(.plain)
+                        .listRowBackground(PlaylistPickerRowBackground())
                     }
                 }
+
+                Section("新建") {
+                    HStack {
+                        TextField("播放列表名称", text: $newPlaylistName)
+                        Button("创建并加入") {
+                            viewModel.createPlaylist(named: newPlaylistName, adding: viewModel.playlistPickerItem)
+                            newPlaylistName = ""
+                            viewModel.showPlaylistPicker = false
+                        }
+                        .disabled(newPlaylistName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    }
+                }
+                .listRowBackground(PlaylistPickerRowBackground())
             }
+            .listStyle(.insetGrouped)
+            .scrollContentBackground(.hidden)
+            .background(Color.clear)
         }
-        .listStyle(.insetGrouped)
+        .toolbarBackground(.hidden, for: .navigationBar)
+    }
+}
+
+private struct PlaylistPickerRowBackground: View {
+    var body: some View {
+        Color.white
+            .opacity(0.14)
+            .background(.ultraThinMaterial)
     }
 }
 
@@ -802,6 +956,55 @@ private struct SettingsScreen: View {
                         viewModel.clearRecentlyPlayed()
                     }
                 }
+            }
+
+            Section {
+                LabeledContent("音频缓存", value: viewModel.audioCacheSizeText)
+
+                Toggle("缓存最近播放 100 首", isOn: $viewModel.cachesRecentPlays)
+                    .onChange(of: viewModel.cachesRecentPlays) { _, enabled in
+                        viewModel.setCachesRecentPlays(enabled)
+                    }
+
+                Toggle("缓存我的收藏", isOn: $viewModel.cachesFavorites)
+                    .onChange(of: viewModel.cachesFavorites) { _, enabled in
+                        viewModel.setCachesFavorites(enabled)
+                    }
+                    .disabled(viewModel.favorites.isEmpty)
+
+                if !viewModel.playlists.isEmpty {
+                    ForEach(viewModel.playlists) { playlist in
+                        Toggle("\(playlist.name)（\(playlist.items.count) 首）", isOn: Binding(
+                            get: { viewModel.isPlaylistCached(playlist.id) },
+                            set: { viewModel.setPlaylist(playlist.id, cached: $0) }
+                        ))
+                    }
+                }
+
+                if !viewModel.audioCacheStatusText.isEmpty {
+                    Text(viewModel.audioCacheStatusText)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+
+                Button {
+                    viewModel.warmConfiguredAudioCache()
+                } label: {
+                    Label("立即缓存已选择列表", systemImage: "arrow.down.circle")
+                }
+                .disabled(!viewModel.hasConfiguredAudioCacheLists)
+
+                Button("清理未保留缓存") {
+                    viewModel.pruneAudioCache()
+                }
+
+                Button("清空音频缓存", role: .destructive) {
+                    viewModel.clearAudioCache()
+                }
+            } header: {
+                Text("缓存")
+            } footer: {
+                Text("默认保留最近播放的 100 首。勾选我的收藏或播放列表后，会后台缓存其中全部音乐；取消勾选后，歌曲仍可能因最近播放继续保留。")
             }
 
             Section("备份与恢复") {
@@ -1097,6 +1300,7 @@ private struct WebLoginView: UIViewRepresentable {
 private struct MusicRow: View {
     @ObservedObject var viewModel: BMusicViewModel
     let item: BMusicVideo
+    var queueContext: [BMusicVideo]? = nil
 
     var body: some View {
         VideoRow(
@@ -1105,7 +1309,13 @@ private struct MusicRow: View {
             actionSystemImage: "plus",
             favoriteSystemImage: viewModel.isFavorite(item) ? "heart.fill" : "heart"
         ) {
-            Task { await viewModel.play(item) }
+            Task {
+                if let queueContext {
+                    await viewModel.play(item, in: queueContext)
+                } else {
+                    await viewModel.play(item)
+                }
+            }
         } favoriteAction: {
             viewModel.toggleFavorite(item)
         } addAction: {
@@ -1587,11 +1797,11 @@ private struct PlayerQueueSection: View {
             if viewModel.queue.isEmpty {
                 ContentUnavailableView("队列为空", systemImage: "music.note.list", description: Text("从搜索结果添加歌曲后，会出现在这里。"))
             } else {
-                ForEach(viewModel.queue) { item in
-                    MusicRow(viewModel: viewModel, item: item)
+                ForEach(viewModel.playbackQueueDisplayItems) { item in
+                    MusicRow(viewModel: viewModel, item: item, queueContext: viewModel.queue)
                 }
                 .onDelete { offsets in
-                    viewModel.removeFromQueue(at: offsets)
+                    viewModel.removeFromDisplayedQueue(at: offsets)
                 }
             }
         }
@@ -1612,20 +1822,20 @@ private struct PlayerQueueList: View {
                     .padding(.vertical)
             } else {
                 LazyVStack(spacing: 0) {
-                    ForEach(viewModel.queue) { item in
+                    ForEach(viewModel.playbackQueueDisplayItems) { item in
                         PlayerQueueRow(
                             item: item,
                             isCurrent: viewModel.currentItem?.id == item.id,
                             isFavorite: viewModel.isFavorite(item)
                         ) {
-                            Task { await viewModel.play(item) }
+                            Task { await viewModel.play(item, in: viewModel.queue) }
                         } favoriteAction: {
                             viewModel.toggleFavorite(item)
                         } addAction: {
                             viewModel.showPlaylistPicker(for: item)
                         }
 
-                        if item.id != viewModel.queue.last?.id {
+                        if item.id != viewModel.playbackQueueDisplayItems.last?.id {
                             Divider()
                                 .opacity(0.22)
                                 .padding(.leading, 92)
@@ -1799,6 +2009,14 @@ final class BMusicViewModel: ObservableObject {
     @Published var playbackMode: BMusicPlaybackMode = .listLoop
     @Published var showPlaylistPicker = false
     @Published var playlistPickerItem: BMusicVideo?
+    @Published var cachesRecentPlays = true
+    @Published var cachesFavorites = false
+    @Published var cachedPlaylistIDs: Set<UUID> = []
+    @Published var audioCacheSizeText = "计算中"
+    @Published var audioCacheStatusText = ""
+    @Published var recommendations = BMusicRecommendationStore.fallbackRecommendations
+    @Published var recommendationShuffleSeed = 0
+    @Published var isLoadingRecommendedKeywords = false
     let playbackProgress = BMusicPlaybackProgress()
 
     private let cookieStore = CookieStore()
@@ -1806,11 +2024,15 @@ final class BMusicViewModel: ObservableObject {
     private lazy var loginClient = BiliLoginClient(cookieStore: cookieStore)
     private var audioPlayer: NativeAudioPlayer!
     private let libraryStore = BMusicLibraryStore()
+    private let cachePreferencesStore = BMusicCachePreferencesStore()
+    private let recommendationStore = BMusicRecommendationStore()
     private var page = 1
     private var hasMore = true
     private var loginTask: Task<Void, Never>?
     private var lastWebLoginCookie = ""
     private var playbackRequestID = UUID()
+    private var currentQueueIndex: Int?
+    private var audioCacheTask: Task<Void, Never>?
 
     var canPlayNext: Bool {
         guard !queue.isEmpty else { return false }
@@ -1834,6 +2056,30 @@ final class BMusicViewModel: ObservableObject {
         return queue.indices.contains(index - 1)
     }
 
+    var hasConfiguredAudioCacheLists: Bool {
+        (cachesFavorites && !favorites.isEmpty)
+            || playlists.contains { cachedPlaylistIDs.contains($0.id) && !$0.items.isEmpty }
+    }
+
+    var playbackQueueDisplayItems: [BMusicVideo] {
+        guard !queue.isEmpty else {
+            return []
+        }
+
+        guard playbackMode != .shuffle,
+              let index = currentQueueDisplayIndex(),
+              queue.indices.contains(index)
+        else {
+            return queue
+        }
+
+        return Array(queue[index...]) + Array(queue[..<index])
+    }
+
+    var displayRecommendations: [BMusicRecommendation] {
+        BMusicRecommendationStore.displayRecommendations(from: recommendations, seed: recommendationShuffleSeed)
+    }
+
     init() {
         audioPlayer = NativeAudioPlayer { [weak self] event, payload in
             Task { @MainActor in
@@ -1841,6 +2087,8 @@ final class BMusicViewModel: ObservableObject {
             }
         }
         restoreLibrary()
+        restoreCachePreferences()
+        refreshAudioCacheSize()
     }
 
     func refreshUser() async {
@@ -1891,6 +2139,50 @@ final class BMusicViewModel: ObservableObject {
         } catch {
             errorMessage = error.localizedDescription
         }
+    }
+
+    func refreshRecommendedKeywords(force: Bool = false) async {
+        if !force,
+           let snapshot = recommendationStore.load(),
+           Date().timeIntervalSince(snapshot.updatedAt) < 12 * 60 * 60 {
+            recommendations = snapshot.recommendations
+            return
+        }
+
+        isLoadingRecommendedKeywords = true
+        defer { isLoadingRecommendedKeywords = false }
+
+        do {
+            let recommendations = try await fetchBilibiliRecommendations()
+            if !recommendations.isEmpty {
+                self.recommendations = recommendations
+                recommendationStore.save(BMusicRecommendationSnapshot(updatedAt: Date(), recommendations: recommendations))
+            }
+        } catch {
+            if let snapshot = recommendationStore.load(), !snapshot.recommendations.isEmpty {
+                recommendations = snapshot.recommendations
+            } else {
+                recommendations = BMusicRecommendationStore.rotatedFallbackRecommendations()
+            }
+        }
+    }
+
+    func shuffleRecommendations() {
+        recommendationShuffleSeed += 1
+    }
+
+    private func fetchBilibiliRecommendations() async throws -> [BMusicRecommendation] {
+        let rankingRIDs = [3, 28, 30, 31]
+        var weightedKeywords: [BMusicWeightedKeyword] = []
+
+        for rid in rankingRIDs {
+            let response = try await apiClient.musicRanking(rid: rid)
+            weightedKeywords.append(contentsOf: BMusicRecommendationExtractor.keywords(fromRankingResponse: response))
+        }
+
+        let recommendations = BMusicRecommendationExtractor.recommendations(from: weightedKeywords)
+        let fallback = BMusicRecommendationStore.rotatedFallbackRecommendations()
+        return Array(Self.deduplicatedRecommendations(recommendations + fallback).prefix(40))
     }
 
     func loadMoreIfNeeded(current item: BMusicVideo) async {
@@ -1953,7 +2245,10 @@ final class BMusicViewModel: ObservableObject {
         if currentItem?.id == item.id {
             cancelPendingPlayback()
             currentItem = nil
+            currentQueueIndex = nil
             _ = audioPlayer.stop()
+        } else {
+            syncCurrentQueueIndex()
         }
         saveLibrary()
     }
@@ -1964,7 +2259,25 @@ final class BMusicViewModel: ObservableObject {
         if let currentItem, removedIDs.contains(currentItem.id) {
             cancelPendingPlayback()
             self.currentItem = nil
+            currentQueueIndex = nil
             _ = audioPlayer.stop()
+        } else {
+            syncCurrentQueueIndex()
+        }
+        saveLibrary()
+    }
+
+    func removeFromDisplayedQueue(at offsets: IndexSet) {
+        let displayItems = playbackQueueDisplayItems
+        let removedIDs = offsets.compactMap { displayItems.indices.contains($0) ? displayItems[$0].id : nil }
+        queue.removeAll { removedIDs.contains($0.id) }
+        if let currentItem, removedIDs.contains(currentItem.id) {
+            cancelPendingPlayback()
+            self.currentItem = nil
+            currentQueueIndex = nil
+            _ = audioPlayer.stop()
+        } else {
+            syncCurrentQueueIndex()
         }
         saveLibrary()
     }
@@ -1992,16 +2305,21 @@ final class BMusicViewModel: ObservableObject {
     func removeFavorite(_ item: BMusicVideo) {
         favorites.removeAll { $0.id == item.id }
         saveLibrary()
+        pruneAudioCache()
     }
 
     func removeFavorites(at offsets: IndexSet) {
         favorites.remove(atOffsets: offsets)
         saveLibrary()
+        pruneAudioCache()
     }
 
     func replaceFavorites(with importedFavorites: [BMusicVideo]) {
         favorites = Self.deduplicatedVideos(importedFavorites)
         saveLibrary()
+        if cachesFavorites {
+            warmConfiguredAudioCache()
+        }
     }
 
     func mergeFavorites(from importedFavorites: [BMusicVideo]) -> Int {
@@ -2010,6 +2328,9 @@ final class BMusicViewModel: ObservableObject {
         let newFavorites = importedUniqueFavorites.filter { !existingIDs.contains($0.id) }
         favorites = newFavorites + favorites
         saveLibrary()
+        if cachesFavorites {
+            warmConfiguredAudioCache()
+        }
         return newFavorites.count
     }
 
@@ -2020,6 +2341,9 @@ final class BMusicViewModel: ObservableObject {
         reorderedFavorites.append(contentsOf: favorites.filter { !reorderedIDs.contains($0.id) })
         favorites = reorderedFavorites
         saveLibrary()
+        if cachesFavorites {
+            warmConfiguredAudioCache()
+        }
     }
 
     func makeListBackupFiles() throws -> [URL] {
@@ -2068,17 +2392,129 @@ final class BMusicViewModel: ObservableObject {
         }
 
         saveLibrary()
+        if hasConfiguredAudioCacheLists {
+            warmConfiguredAudioCache()
+        } else {
+            pruneAudioCache()
+        }
         return summary
     }
 
     func removeRecentlyPlayed(at offsets: IndexSet) {
         recentlyPlayed.remove(atOffsets: offsets)
         saveLibrary()
+        pruneAudioCache()
     }
 
     func clearRecentlyPlayed() {
         recentlyPlayed = []
         saveLibrary()
+        pruneAudioCache()
+    }
+
+    func setCachesRecentPlays(_ enabled: Bool) {
+        cachesRecentPlays = enabled
+        saveCachePreferences()
+        pruneAudioCache()
+    }
+
+    func setCachesFavorites(_ enabled: Bool) {
+        cachesFavorites = enabled
+        saveCachePreferences()
+        if enabled {
+            warmConfiguredAudioCache()
+        } else {
+            pruneAudioCache()
+        }
+    }
+
+    func isPlaylistCached(_ playlistID: UUID) -> Bool {
+        cachedPlaylistIDs.contains(playlistID)
+    }
+
+    func setPlaylist(_ playlistID: UUID, cached: Bool) {
+        if cached {
+            cachedPlaylistIDs.insert(playlistID)
+        } else {
+            cachedPlaylistIDs.remove(playlistID)
+        }
+        saveCachePreferences()
+        if cached {
+            warmConfiguredAudioCache()
+        } else {
+            pruneAudioCache()
+        }
+    }
+
+    func warmConfiguredAudioCache() {
+        let items = configuredAudioCacheItems()
+        guard !items.isEmpty else {
+            audioCacheStatusText = "还没有选择需要固定缓存的列表。"
+            pruneAudioCache()
+            return
+        }
+
+        audioCacheTask?.cancel()
+        audioCacheTask = Task { [weak self, items] in
+            guard let self else { return }
+            var finished = 0
+            var failed = 0
+
+            for item in items {
+                if Task.isCancelled {
+                    return
+                }
+
+                self.audioCacheStatusText = "正在缓存 \(finished + 1)/\(items.count)：\(item.title)"
+                do {
+                    try await self.cacheAudio(item)
+                    finished += 1
+                } catch {
+                    failed += 1
+                }
+            }
+
+            if failed > 0 {
+                self.audioCacheStatusText = "已缓存 \(finished) 首，\(failed) 首暂时失败。"
+            } else {
+                self.audioCacheStatusText = "已缓存 \(finished) 首。"
+            }
+            self.refreshAudioCacheSize()
+            self.pruneAudioCache()
+        }
+    }
+
+    func pruneAudioCache() {
+        let keepIDs = audioCacheKeepIDs()
+        Task { [weak self, keepIDs] in
+            await BMusicAudioCache.shared.prune(keeping: keepIDs)
+            let size = await BMusicAudioCache.shared.sizeInBytes()
+            await MainActor.run {
+                self?.audioCacheSizeText = size.bMusicByteSizeText
+            }
+        }
+    }
+
+    func clearAudioCache() {
+        audioCacheTask?.cancel()
+        let keepIDs = currentItem.map { Set([$0.id]) } ?? []
+        Task { [weak self, keepIDs] in
+            await BMusicAudioCache.shared.clear(keeping: keepIDs)
+            let size = await BMusicAudioCache.shared.sizeInBytes()
+            await MainActor.run {
+                self?.audioCacheSizeText = size.bMusicByteSizeText
+                self?.audioCacheStatusText = keepIDs.isEmpty ? "音频缓存已清空。" : "已清空缓存，当前播放中的歌曲暂时保留。"
+            }
+        }
+    }
+
+    func refreshAudioCacheSize() {
+        Task { [weak self] in
+            let size = await BMusicAudioCache.shared.sizeInBytes()
+            await MainActor.run {
+                self?.audioCacheSizeText = size.bMusicByteSizeText
+            }
+        }
     }
 
     func isFavoriteArtist(_ artist: BMusicArtist) -> Bool {
@@ -2161,8 +2597,12 @@ final class BMusicViewModel: ObservableObject {
     }
 
     func deletePlaylists(at offsets: IndexSet) {
+        let removedIDs = offsets.compactMap { playlists.indices.contains($0) ? playlists[$0].id : nil }
         playlists.remove(atOffsets: offsets)
+        cachedPlaylistIDs.subtract(removedIDs)
+        saveCachePreferences()
         saveLibrary()
+        pruneAudioCache()
     }
 
     func renamePlaylist(_ playlistID: UUID, to name: String) {
@@ -2183,6 +2623,7 @@ final class BMusicViewModel: ObservableObject {
         }
         playlists[index].items = []
         saveLibrary()
+        pruneAudioCache()
     }
 
     func add(_ item: BMusicVideo, toPlaylist playlistID: UUID) {
@@ -2192,6 +2633,9 @@ final class BMusicViewModel: ObservableObject {
         playlists[index].items.removeAll { $0.id == item.id }
         playlists[index].items.insert(item, at: 0)
         saveLibrary()
+        if cachedPlaylistIDs.contains(playlistID) {
+            warmConfiguredAudioCache()
+        }
     }
 
     func remove(_ item: BMusicVideo, fromPlaylist playlistID: UUID) {
@@ -2200,6 +2644,7 @@ final class BMusicViewModel: ObservableObject {
         }
         playlists[index].items.removeAll { $0.id == item.id }
         saveLibrary()
+        pruneAudioCache()
     }
 
     func removeItems(fromPlaylist playlistID: UUID, at offsets: IndexSet) {
@@ -2208,6 +2653,7 @@ final class BMusicViewModel: ObservableObject {
         }
         playlists[index].items.remove(atOffsets: offsets)
         saveLibrary()
+        pruneAudioCache()
     }
 
     func moveItems(inPlaylist playlistID: UUID, from source: IndexSet, to destination: Int) {
@@ -2218,6 +2664,16 @@ final class BMusicViewModel: ObservableObject {
         saveLibrary()
     }
 
+    func play(_ item: BMusicVideo, in queueContext: [BMusicVideo]) async {
+        let context = queueContext.contains(where: { $0.id == item.id }) ? queueContext : queueContext + [item]
+        if !context.isEmpty {
+            queue = context
+            currentQueueIndex = context.firstIndex { $0.id == item.id }
+            saveLibrary()
+        }
+        await play(item)
+    }
+
     func play(_ item: BMusicVideo) async {
         let requestID = UUID()
         playbackRequestID = requestID
@@ -2225,6 +2681,7 @@ final class BMusicViewModel: ObservableObject {
         if !queue.contains(where: { $0.id == item.id }) {
             queue.append(item)
         }
+        currentQueueIndex = queue.firstIndex { $0.id == item.id }
 
         currentItem = item
         isResolvingPlayback = true
@@ -2239,6 +2696,22 @@ final class BMusicViewModel: ObservableObject {
         }
 
         do {
+            if try await audioPlayer.playCached(
+                cacheID: item.id,
+                title: item.title,
+                artist: item.author,
+                artworkURL: item.coverURL?.absoluteString
+            ) {
+                guard isCurrentPlaybackRequest(requestID) else {
+                    return
+                }
+                currentItem = item
+                addRecentlyPlayed(item)
+                playbackDetail = "使用本地缓存播放"
+                playbackProgress.reset(detail: "使用本地缓存播放")
+                return
+            }
+
             let resolved = try await resolvePlayableVideo(item)
             guard isCurrentPlaybackRequest(requestID) else {
                 return
@@ -2252,7 +2725,8 @@ final class BMusicViewModel: ObservableObject {
                 title: resolved.video.title,
                 artist: resolved.video.author,
                 artworkURL: resolved.video.coverURL?.absoluteString,
-                cookie: cookieStore.read()
+                cookie: cookieStore.read(),
+                cacheID: resolved.video.id
             )
             guard isCurrentPlaybackRequest(requestID) else {
                 return
@@ -2438,10 +2912,15 @@ final class BMusicViewModel: ObservableObject {
     }
 
     private func replaceQueueItem(_ item: BMusicVideo) {
-        guard let index = queue.firstIndex(where: { $0.id == item.id }) else {
+        if let currentQueueIndex, queue.indices.contains(currentQueueIndex) {
+            queue[currentQueueIndex] = item
+        } else if let index = queue.firstIndex(where: { $0.id == item.id }) {
+            queue[index] = item
+            currentQueueIndex = index
+        } else {
             return
         }
-        queue[index] = item
+
         if let favoriteIndex = favorites.firstIndex(where: { $0.id == item.id }) {
             favorites[favoriteIndex] = item
         }
@@ -2463,6 +2942,42 @@ final class BMusicViewModel: ObservableObject {
             recentlyPlayed = Array(recentlyPlayed.prefix(100))
         }
         saveLibrary()
+        pruneAudioCache()
+    }
+
+    private func cacheAudio(_ item: BMusicVideo) async throws {
+        let resolved = try await resolvePlayableVideo(item)
+        guard let audioURL = URL(string: resolved.audioURL) else {
+            throw NativeAudioError.invalidURL
+        }
+        _ = try await BMusicAudioCache.shared.audioURL(
+            for: resolved.video.id,
+            sourceURL: audioURL,
+            cookie: cookieStore.read()
+        )
+    }
+
+    private func configuredAudioCacheItems() -> [BMusicVideo] {
+        var items: [BMusicVideo] = []
+        if cachesFavorites {
+            items.append(contentsOf: favorites)
+        }
+        for playlist in playlists where cachedPlaylistIDs.contains(playlist.id) {
+            items.append(contentsOf: playlist.items)
+        }
+        return Self.deduplicatedVideos(items)
+    }
+
+    private func audioCacheKeepIDs() -> Set<String> {
+        var ids = Set<String>()
+        if cachesRecentPlays {
+            ids.formUnion(recentlyPlayed.prefix(100).map(\.id))
+        }
+        ids.formUnion(configuredAudioCacheItems().map(\.id))
+        if let currentItem {
+            ids.insert(currentItem.id)
+        }
+        return ids
     }
 
     private func restoreLibrary() {
@@ -2474,6 +2989,13 @@ final class BMusicViewModel: ObservableObject {
         favoriteArtists = snapshot.favoriteArtists
     }
 
+    private func restoreCachePreferences() {
+        let preferences = cachePreferencesStore.load()
+        cachesRecentPlays = preferences.cachesRecentPlays
+        cachesFavorites = preferences.cachesFavorites
+        cachedPlaylistIDs = Set(preferences.cachedPlaylistIDs)
+    }
+
     private func saveLibrary() {
         libraryStore.save(BMusicLibrarySnapshot(
             queue: queue,
@@ -2481,6 +3003,14 @@ final class BMusicViewModel: ObservableObject {
             recentlyPlayed: recentlyPlayed,
             playlists: playlists,
             favoriteArtists: favoriteArtists
+        ))
+    }
+
+    private func saveCachePreferences() {
+        cachePreferencesStore.save(BMusicCachePreferences(
+            cachesRecentPlays: cachesRecentPlays,
+            cachesFavorites: cachesFavorites,
+            cachedPlaylistIDs: Array(cachedPlaylistIDs)
         ))
     }
 
@@ -2523,6 +3053,21 @@ final class BMusicViewModel: ObservableObject {
         return videos.filter { seen.insert($0.id).inserted }
     }
 
+    private static func deduplicatedStrings(_ values: [String]) -> [String] {
+        var seen = Set<String>()
+        return values.filter { value in
+            let normalized = value.lowercased()
+            return seen.insert(normalized).inserted
+        }
+    }
+
+    private static func deduplicatedRecommendations(_ values: [BMusicRecommendation]) -> [BMusicRecommendation] {
+        var seen = Set<String>()
+        return values.filter { value in
+            seen.insert(value.keyword.lowercased()).inserted
+        }
+    }
+
     private func nextQueueItem() -> BMusicVideo? {
         guard !queue.isEmpty else {
             return nil
@@ -2535,9 +3080,7 @@ final class BMusicViewModel: ObservableObject {
             return queue.filter { $0.id != currentItem.id }.randomElement()
         }
 
-        guard let currentItem,
-              let index = queue.firstIndex(where: { $0.id == currentItem.id })
-        else {
+        guard let index = resolvedCurrentQueueIndex() else {
             return queue.first
         }
 
@@ -2560,9 +3103,7 @@ final class BMusicViewModel: ObservableObject {
             return queue.filter { $0.id != currentItem.id }.randomElement()
         }
 
-        guard let currentItem,
-              let index = queue.firstIndex(where: { $0.id == currentItem.id })
-        else {
+        guard let index = resolvedCurrentQueueIndex() else {
             return queue.first
         }
 
@@ -2571,6 +3112,39 @@ final class BMusicViewModel: ObservableObject {
         }
 
         return playbackMode == .listLoop ? queue.last : nil
+    }
+
+    private func resolvedCurrentQueueIndex() -> Int? {
+        if let currentQueueIndex, queue.indices.contains(currentQueueIndex) {
+            return currentQueueIndex
+        }
+
+        guard let currentItem,
+              let index = queue.firstIndex(where: { $0.id == currentItem.id })
+        else {
+            return nil
+        }
+
+        currentQueueIndex = index
+        return index
+    }
+
+    private func currentQueueDisplayIndex() -> Int? {
+        if let currentQueueIndex, queue.indices.contains(currentQueueIndex) {
+            return currentQueueIndex
+        }
+
+        guard let currentItem else {
+            return nil
+        }
+
+        return queue.firstIndex { $0.id == currentItem.id }
+    }
+
+    private func syncCurrentQueueIndex() {
+        currentQueueIndex = currentItem.flatMap { current in
+            queue.firstIndex { $0.id == current.id }
+        }
     }
 
     private func handlePlaybackEnded() {
@@ -2955,6 +3529,264 @@ struct BMusicListImportSummary {
     var createdPlaylists = 0
 }
 
+struct BMusicRecommendation: Codable, Identifiable, Hashable {
+    var keyword: String
+    var score: Int
+
+    var id: String {
+        keyword
+    }
+}
+
+struct BMusicWeightedKeyword {
+    var keyword: String
+    var score: Int
+}
+
+struct BMusicRecommendationSnapshot: Codable {
+    var updatedAt: Date
+    var recommendations: [BMusicRecommendation]
+
+    enum CodingKeys: String, CodingKey {
+        case updatedAt
+        case recommendations
+        case keywords
+    }
+
+    init(updatedAt: Date, recommendations: [BMusicRecommendation]) {
+        self.updatedAt = updatedAt
+        self.recommendations = recommendations
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        updatedAt = try container.decode(Date.self, forKey: .updatedAt)
+        if let recommendations = try container.decodeIfPresent([BMusicRecommendation].self, forKey: .recommendations) {
+            self.recommendations = recommendations
+        } else {
+            let keywords = try container.decodeIfPresent([String].self, forKey: .keywords) ?? []
+            self.recommendations = keywords.enumerated().map { index, keyword in
+                BMusicRecommendation(keyword: keyword, score: max(1, 10 - index))
+            }
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(updatedAt, forKey: .updatedAt)
+        try container.encode(recommendations, forKey: .recommendations)
+    }
+}
+
+final class BMusicRecommendationStore {
+    static let displayLimit = 14
+    static let fallbackKeywords = ["周杰伦", "邓紫棋", "林俊杰", "洛天依", "起风了", "晴天", "达拉崩吧", "光年之外"]
+    static let fallbackRecommendations = fallbackKeywords.enumerated().map { index, keyword in
+        BMusicRecommendation(keyword: keyword, score: max(1, 10 - index))
+    }
+
+    private let key = "b-music-recommendations-v1"
+    private let defaults: UserDefaults
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+    }
+
+    func load() -> BMusicRecommendationSnapshot? {
+        guard let data = defaults.data(forKey: key) else {
+            return nil
+        }
+        return try? JSONDecoder().decode(BMusicRecommendationSnapshot.self, from: data)
+    }
+
+    func save(_ snapshot: BMusicRecommendationSnapshot) {
+        guard let data = try? JSONEncoder().encode(snapshot) else {
+            return
+        }
+        defaults.set(data, forKey: key)
+    }
+
+    static func rotatedFallbackRecommendations() -> [BMusicRecommendation] {
+        let day = Calendar.current.ordinality(of: .day, in: .era, for: Date()) ?? 0
+        let offset = day % fallbackRecommendations.count
+        return Array(fallbackRecommendations[offset...]) + Array(fallbackRecommendations[..<offset])
+    }
+
+    static func displayRecommendations(from recommendations: [BMusicRecommendation], seed: Int) -> [BMusicRecommendation] {
+        let source = recommendations.isEmpty ? fallbackRecommendations : recommendations
+        return source
+            .sorted { lhs, rhs in
+                let lhsRank = lhs.score * 10 + stableJitter(lhs.keyword, seed: seed)
+                let rhsRank = rhs.score * 10 + stableJitter(rhs.keyword, seed: seed)
+                if lhsRank == rhsRank {
+                    return lhs.keyword < rhs.keyword
+                }
+                return lhsRank > rhsRank
+            }
+            .prefix(displayLimit)
+            .enumerated()
+            .sorted { lhs, rhs in
+                let left = stableJitter(lhs.element.keyword, seed: seed + lhs.offset + 11)
+                let right = stableJitter(rhs.element.keyword, seed: seed + rhs.offset + 11)
+                return left > right
+            }
+            .map(\.element)
+    }
+
+    private static func stableJitter(_ keyword: String, seed: Int) -> Int {
+        abs((keyword + "\(seed)").stableHash % 100)
+    }
+}
+
+enum BMusicRecommendationExtractor {
+    static func keywords(fromRankingResponse response: Any) -> [BMusicWeightedKeyword] {
+        guard let root = response as? [String: Any],
+              let data = root["data"] as? [String: Any],
+              let list = data["list"] as? [[String: Any]]
+        else {
+            return []
+        }
+
+        return list.enumerated().flatMap { index, item -> [BMusicWeightedKeyword] in
+            let baseScore = max(1, 36 - index)
+            var values: [BMusicWeightedKeyword] = []
+            if let title = item["title"] as? String {
+                values.append(contentsOf: weightedKeywords(fromTitle: title).map { keyword in
+                    BMusicWeightedKeyword(keyword: keyword.keyword, score: baseScore + keyword.score)
+                })
+            }
+            if let owner = item["owner"] as? [String: Any],
+               let name = owner["name"] as? String {
+                values.append(contentsOf: keywords(fromOwnerName: name).map { keyword in
+                    BMusicWeightedKeyword(keyword: keyword, score: baseScore + 16)
+                })
+            }
+            return values
+        }
+    }
+
+    static func recommendations(from weightedKeywords: [BMusicWeightedKeyword]) -> [BMusicRecommendation] {
+        var scores: [String: (keyword: String, score: Int)] = [:]
+        for item in weightedKeywords {
+            let normalized = item.keyword.lowercased()
+            if let existing = scores[normalized] {
+                scores[normalized] = (existing.keyword, existing.score + item.score)
+            } else {
+                scores[normalized] = (item.keyword, item.score)
+            }
+        }
+
+        return scores.values
+            .map { BMusicRecommendation(keyword: $0.keyword, score: $0.score) }
+            .sorted { lhs, rhs in
+                if lhs.score == rhs.score {
+                    return lhs.keyword < rhs.keyword
+                }
+                return lhs.score > rhs.score
+            }
+    }
+
+    private static func weightedKeywords(fromTitle title: String) -> [(keyword: String, score: Int)] {
+        let cleaned = title.cleanedHTML()
+        let quoted = extractQuotedKeywords(from: cleaned)
+        if !quoted.isEmpty {
+            return quoted.map { ($0, 22) }
+        }
+
+        let separators = CharacterSet(charactersIn: "｜|/-_【】[]（）()《》「」『』“”\"：:，,。· ")
+        return cleaned
+            .components(separatedBy: separators)
+            .map(cleanKeyword)
+            .filter(isUsefulKeyword)
+            .prefix(1)
+            .map { ($0, 4) }
+    }
+
+    private static func keywords(fromOwnerName name: String) -> [String] {
+        let cleaned = cleanKeyword(name)
+        guard isUsefulKeyword(cleaned), cleaned.count <= 12 else {
+            return []
+        }
+        return [cleaned]
+    }
+
+    private static func extractQuotedKeywords(from text: String) -> [String] {
+        let patterns = [
+            #"《([^》]{2,18})》"#,
+            #"「([^」]{2,18})」"#,
+            #"『([^』]{2,18})』"#,
+            #""([^"]{2,18})""#
+        ]
+
+        return patterns.flatMap { pattern in
+            guard let regex = try? NSRegularExpression(pattern: pattern) else {
+                return [String]()
+            }
+            let range = NSRange(text.startIndex..<text.endIndex, in: text)
+            return regex.matches(in: text, range: range).compactMap { match in
+                guard let valueRange = Range(match.range(at: 1), in: text) else {
+                    return nil
+                }
+                let value = cleanKeyword(String(text[valueRange]))
+                return isUsefulKeyword(value) ? value : nil
+            }
+        }
+    }
+
+    private static func cleanKeyword(_ value: String) -> String {
+        value
+            .replacingOccurrences(of: #"(?i)\bcover\b"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: #"(?i)\bmv\b"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: #"(?i)\blive\b"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: #"(?i)\bfull\b"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: "翻唱", with: "")
+            .replacingOccurrences(of: "完整版", with: "")
+            .replacingOccurrences(of: "动态歌词", with: "")
+            .replacingOccurrences(of: "现场", with: "")
+            .replacingOccurrences(of: "原唱", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func isUsefulKeyword(_ value: String) -> Bool {
+        guard value.count >= 2, value.count <= 18 else {
+            return false
+        }
+        let blocked = ["音乐", "歌曲", "合集", "高音质", "官方", "投稿", "视频", "字幕", "伴奏", "纯音乐"]
+        return !blocked.contains(value)
+    }
+}
+
+struct BMusicCachePreferences: Codable {
+    var cachesRecentPlays = true
+    var cachesFavorites = false
+    var cachedPlaylistIDs: [UUID] = []
+}
+
+final class BMusicCachePreferencesStore {
+    private let key = "b-music-cache-preferences-v1"
+    private let defaults: UserDefaults
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+    }
+
+    func load() -> BMusicCachePreferences {
+        guard let data = defaults.data(forKey: key),
+              let preferences = try? JSONDecoder().decode(BMusicCachePreferences.self, from: data)
+        else {
+            return BMusicCachePreferences()
+        }
+        return preferences
+    }
+
+    func save(_ preferences: BMusicCachePreferences) {
+        guard let data = try? JSONEncoder().encode(preferences) else {
+            return
+        }
+        defaults.set(data, forKey: key)
+    }
+}
+
 final class BMusicLibraryStore {
     private let key = "b-music-library-v1"
     private let defaults: UserDefaults
@@ -3038,6 +3870,21 @@ private extension String {
             .joined(separator: "-")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return cleaned.isEmpty ? "未命名列表" : cleaned
+    }
+
+    var stableHash: Int {
+        unicodeScalars.reduce(5381) { hash, scalar in
+            ((hash << 5) &+ hash) &+ Int(scalar.value)
+        }
+    }
+}
+
+private extension Int64 {
+    var bMusicByteSizeText: String {
+        let formatter = ByteCountFormatter()
+        formatter.allowedUnits = [.useMB, .useGB]
+        formatter.countStyle = .file
+        return formatter.string(fromByteCount: self)
     }
 }
 

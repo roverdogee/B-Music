@@ -28,7 +28,7 @@ final class NativeAudioPlayer {
     private var currentArtist = ""
     private var currentArtwork: MPMediaItemArtwork?
     private var artworkTask: Task<Void, Never>?
-    private var downloadedAudioURL: URL?
+    private var temporaryAudioURL: URL?
     private var playbackRequestID = UUID()
     private let sendEvent: (String, [String: Any]) -> Void
 
@@ -37,7 +37,45 @@ final class NativeAudioPlayer {
         configureRemoteCommands()
     }
 
-    func play(url: String, title: String?, artist: String?, artworkURL: String?, cookie: String = "") async throws -> Any {
+    func playCached(cacheID: String, title: String?, artist: String?, artworkURL: String?) async throws -> Bool {
+        guard let localURL = await BMusicAudioCache.shared.cachedURL(for: cacheID) else {
+            return false
+        }
+
+        let requestID = UUID()
+        playbackRequestID = requestID
+        artworkTask?.cancel()
+        artworkTask = nil
+        currentArtwork = nil
+        cleanupObservers()
+        player?.pause()
+        player = nil
+        playerItem = nil
+        removeTemporaryAudio()
+        currentTitle = title ?? ""
+        currentArtist = artist ?? ""
+        loadArtwork(from: artworkURL)
+        try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [])
+        try AVAudioSession.sharedInstance().setActive(true)
+
+        sendState("loading", message: "正在读取缓存...")
+        guard isCurrentPlaybackRequest(requestID) else {
+            throw CancellationError()
+        }
+
+        let item = AVPlayerItem(url: localURL)
+        let player = AVPlayer(playerItem: item)
+        self.playerItem = item
+        self.player = player
+        observe(item: item, player: player)
+        updateNowPlaying(playbackRate: 1)
+        sendState("loading")
+        player.play()
+
+        return true
+    }
+
+    func play(url: String, title: String?, artist: String?, artworkURL: String?, cookie: String = "", cacheID: String? = nil) async throws -> Any {
         guard let audioURL = URL(string: url) else {
             throw NativeAudioError.invalidURL
         }
@@ -51,17 +89,22 @@ final class NativeAudioPlayer {
         player?.pause()
         player = nil
         playerItem = nil
-        removeDownloadedAudio()
+        removeTemporaryAudio()
         currentTitle = title ?? ""
         currentArtist = artist ?? ""
         loadArtwork(from: artworkURL)
         try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [])
         try AVAudioSession.sharedInstance().setActive(true)
 
-        sendState("loading", message: "正在下载音频...")
+        sendState("loading", message: "正在准备音频...")
         let localURL: URL
         do {
-            localURL = try await downloadAudio(from: audioURL, cookie: cookie)
+            if let cacheID {
+                localURL = try await BMusicAudioCache.shared.audioURL(for: cacheID, sourceURL: audioURL, cookie: cookie)
+            } else {
+                localURL = try await downloadTemporaryAudio(from: audioURL, cookie: cookie)
+                temporaryAudioURL = localURL
+            }
         } catch {
             if !isCurrentPlaybackRequest(requestID) {
                 throw CancellationError()
@@ -69,11 +112,11 @@ final class NativeAudioPlayer {
             throw error
         }
         guard isCurrentPlaybackRequest(requestID) else {
-            try? FileManager.default.removeItem(at: localURL)
+            if cacheID == nil {
+                try? FileManager.default.removeItem(at: localURL)
+            }
             throw CancellationError()
         }
-
-        downloadedAudioURL = localURL
 
         let item = AVPlayerItem(url: localURL)
         let player = AVPlayer(playerItem: item)
@@ -114,7 +157,7 @@ final class NativeAudioPlayer {
         artworkTask?.cancel()
         artworkTask = nil
         currentArtwork = nil
-        removeDownloadedAudio()
+        removeTemporaryAudio()
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
         sendState("stopped")
         return ["success": true]
@@ -228,10 +271,10 @@ final class NativeAudioPlayer {
         }
     }
 
-    private func downloadAudio(from audioURL: URL, cookie: String) async throws -> URL {
+    private func downloadTemporaryAudio(from audioURL: URL, cookie: String) async throws -> URL {
         var request = URLRequest(url: audioURL)
         request.timeoutInterval = 30
-        for (key, value) in playbackHeaders(cookie: cookie) {
+        for (key, value) in Self.playbackHeaders(cookie: cookie) {
             request.setValue(value, forHTTPHeaderField: key)
         }
 
@@ -254,7 +297,7 @@ final class NativeAudioPlayer {
         }
     }
 
-    private func playbackHeaders(cookie: String) -> [String: String] {
+    static func playbackHeaders(cookie: String) -> [String: String] {
         var headers = [
             "Referer": "https://www.bilibili.com/",
             "Origin": "https://www.bilibili.com",
@@ -277,7 +320,7 @@ final class NativeAudioPlayer {
             do {
                 var request = URLRequest(url: url)
                 request.timeoutInterval = 20
-                for (key, value) in self?.playbackHeaders(cookie: "") ?? [:] {
+                for (key, value) in Self.playbackHeaders(cookie: "") {
                     request.setValue(value, forHTTPHeaderField: key)
                 }
 
@@ -302,13 +345,13 @@ final class NativeAudioPlayer {
         }
     }
 
-    private func removeDownloadedAudio() {
-        guard let downloadedAudioURL else {
+    private func removeTemporaryAudio() {
+        guard let temporaryAudioURL else {
             return
         }
 
-        try? FileManager.default.removeItem(at: downloadedAudioURL)
-        self.downloadedAudioURL = nil
+        try? FileManager.default.removeItem(at: temporaryAudioURL)
+        self.temporaryAudioURL = nil
     }
 
     private func sendState(_ state: String, message: String = "") {
@@ -401,6 +444,164 @@ final class NativeAudioPlayer {
     deinit {
         artworkTask?.cancel()
         cleanupObservers()
-        removeDownloadedAudio()
+        removeTemporaryAudio()
+    }
+}
+
+struct BMusicAudioCacheEntry: Codable {
+    var id: String
+    var fileName: String
+    var lastAccessed: Date
+}
+
+actor BMusicAudioCache {
+    static let shared = BMusicAudioCache()
+
+    private let fileManager = FileManager.default
+    private let cacheDirectory: URL
+    private let indexURL: URL
+    private var entries: [String: BMusicAudioCacheEntry] = [:]
+
+    private init() {
+        let manager = FileManager.default
+        let baseDirectory = manager.urls(for: .cachesDirectory, in: .userDomainMask).first
+            ?? manager.temporaryDirectory
+        let directory = baseDirectory.appendingPathComponent("BMusicAudio", isDirectory: true)
+        cacheDirectory = directory
+        indexURL = directory.appendingPathComponent("index.json")
+        entries = Self.loadEntries(from: directory.appendingPathComponent("index.json"))
+    }
+
+    func audioURL(for id: String, sourceURL: URL, cookie: String) async throws -> URL {
+        if let cachedURL = cachedURL(for: id) {
+            return cachedURL
+        }
+
+        let temporaryURL = try await downloadAudio(from: sourceURL, cookie: cookie)
+        do {
+            return try storeDownloadedAudio(at: temporaryURL, for: id)
+        } catch {
+            try? fileManager.removeItem(at: temporaryURL)
+            throw error
+        }
+    }
+
+    func cachedURL(for id: String) -> URL? {
+        guard var entry = entries[id] else {
+            return nil
+        }
+
+        let url = cacheDirectory.appendingPathComponent(entry.fileName)
+        guard fileManager.fileExists(atPath: url.path) else {
+            entries[id] = nil
+            saveEntries()
+            return nil
+        }
+
+        entry.lastAccessed = Date()
+        entries[id] = entry
+        saveEntries()
+        return url
+    }
+
+    func prune(keeping keepIDs: Set<String>) {
+        for (id, entry) in entries where !keepIDs.contains(id) {
+            let url = cacheDirectory.appendingPathComponent(entry.fileName)
+            try? fileManager.removeItem(at: url)
+            entries[id] = nil
+        }
+        saveEntries()
+    }
+
+    func clear(keeping keepIDs: Set<String> = []) {
+        for (id, entry) in entries where !keepIDs.contains(id) {
+            let url = cacheDirectory.appendingPathComponent(entry.fileName)
+            try? fileManager.removeItem(at: url)
+            entries[id] = nil
+        }
+        saveEntries()
+    }
+
+    func sizeInBytes() -> Int64 {
+        entries.reduce(into: Int64(0)) { total, pair in
+            let url = cacheDirectory.appendingPathComponent(pair.value.fileName)
+            guard let values = try? url.resourceValues(forKeys: [.fileSizeKey]) else {
+                return
+            }
+            total += Int64(values.fileSize ?? 0)
+        }
+    }
+
+    func cachedIDs() -> Set<String> {
+        Set(entries.keys)
+    }
+
+    private func downloadAudio(from audioURL: URL, cookie: String) async throws -> URL {
+        var request = URLRequest(url: audioURL)
+        request.timeoutInterval = 30
+        for (key, value) in NativeAudioPlayer.playbackHeaders(cookie: cookie) {
+            request.setValue(value, forHTTPHeaderField: key)
+        }
+
+        do {
+            let (temporaryURL, response) = try await URLSession.shared.download(for: request)
+            if let httpResponse = response as? HTTPURLResponse,
+               !(200...299).contains(httpResponse.statusCode) {
+                throw NativeAudioError.downloadFailed("音频下载失败 HTTP \(httpResponse.statusCode)")
+            }
+            return temporaryURL
+        } catch let error as NativeAudioError {
+            throw error
+        } catch {
+            throw NativeAudioError.downloadFailed("音频下载失败：\(error.localizedDescription)")
+        }
+    }
+
+    private func storeDownloadedAudio(at temporaryURL: URL, for id: String) throws -> URL {
+        try fileManager.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
+
+        if let oldEntry = entries[id] {
+            try? fileManager.removeItem(at: cacheDirectory.appendingPathComponent(oldEntry.fileName))
+        }
+
+        let fileName = "\(safeFileName(for: id)).m4a"
+        let targetURL = cacheDirectory.appendingPathComponent(fileName)
+        try? fileManager.removeItem(at: targetURL)
+        try fileManager.moveItem(at: temporaryURL, to: targetURL)
+
+        var resourceValues = URLResourceValues()
+        resourceValues.isExcludedFromBackup = true
+        var mutableURL = targetURL
+        try? mutableURL.setResourceValues(resourceValues)
+
+        entries[id] = BMusicAudioCacheEntry(id: id, fileName: fileName, lastAccessed: Date())
+        saveEntries()
+        return targetURL
+    }
+
+    private func safeFileName(for id: String) -> String {
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
+        return id.unicodeScalars.map { scalar in
+            allowed.contains(scalar) ? String(scalar) : "_"
+        }.joined()
+    }
+
+    private static func loadEntries(from url: URL) -> [String: BMusicAudioCacheEntry] {
+        guard let data = try? Data(contentsOf: url),
+              let entries = try? JSONDecoder().decode([String: BMusicAudioCacheEntry].self, from: data)
+        else {
+            return [:]
+        }
+        return entries
+    }
+
+    private func saveEntries() {
+        do {
+            try fileManager.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
+            let data = try JSONEncoder().encode(entries)
+            try data.write(to: indexURL, options: .atomic)
+        } catch {
+            return
+        }
     }
 }

@@ -278,6 +278,41 @@ final class BiliApiClient {
         }
     }
 
+    func musicRanking(rid: Int, limit: Int = 30) async throws -> Any {
+        var components = URLComponents(url: baseURL.appendingPathComponent("/x/web-interface/ranking/v2"), resolvingAgainstBaseURL: false)
+        components?.queryItems = [
+            URLQueryItem(name: "rid", value: String(rid)),
+            URLQueryItem(name: "type", value: "all")
+        ]
+
+        guard let url = components?.url else {
+            throw BiliApiError.invalidRequest
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("https://www.bilibili.com/v/music", forHTTPHeaderField: "Referer")
+        request.setValue(desktopUserAgent, forHTTPHeaderField: "User-Agent")
+
+        let cookie = cookieStore.read()
+        if !cookie.isEmpty {
+            request.setValue(cookie, forHTTPHeaderField: "Cookie")
+        }
+
+        let (data, response) = try await session.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse,
+              (200..<300).contains(httpResponse.statusCode)
+        else {
+            throw BiliApiError.invalidResponse("Bilibili API returned an invalid response")
+        }
+
+        do {
+            return try JSONSerialization.jsonObject(with: data)
+        } catch {
+            throw BiliApiError.invalidResponse("Bilibili API returned a non-JSON response")
+        }
+    }
+
     private func requestWithoutCookie(url: URL) async throws -> Any {
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
