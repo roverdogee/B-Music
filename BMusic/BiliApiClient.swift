@@ -313,11 +313,59 @@ final class BiliApiClient {
         }
     }
 
+    func musicToplistPeriods(listType: Int = 1) async throws -> Any {
+        try await publicJSON(
+            path: "/x/copyright-music-publicity/toplist/all_period",
+            queryItems: [URLQueryItem(name: "list_type", value: String(listType))],
+            referer: "https://www.bilibili.com/v/popular/music"
+        )
+    }
+
+    func musicToplistMusicList(listID: Int) async throws -> Any {
+        try await publicJSON(
+            path: "/x/copyright-music-publicity/toplist/music_list",
+            queryItems: [URLQueryItem(name: "list_id", value: String(listID))],
+            referer: "https://www.bilibili.com/v/popular/music"
+        )
+    }
+
     private func requestWithoutCookie(url: URL) async throws -> Any {
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
         request.setValue("https://www.bilibili.com/", forHTTPHeaderField: "Referer")
         request.setValue(desktopUserAgent, forHTTPHeaderField: "User-Agent")
+
+        let (data, response) = try await session.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse,
+              (200..<300).contains(httpResponse.statusCode)
+        else {
+            throw BiliApiError.invalidResponse("Bilibili API returned an invalid response")
+        }
+
+        do {
+            return try JSONSerialization.jsonObject(with: data)
+        } catch {
+            throw BiliApiError.invalidResponse("Bilibili API returned a non-JSON response")
+        }
+    }
+
+    private func publicJSON(path: String, queryItems: [URLQueryItem], referer: String) async throws -> Any {
+        var components = URLComponents(url: baseURL.appendingPathComponent(path), resolvingAgainstBaseURL: false)
+        components?.queryItems = queryItems
+
+        guard let url = components?.url else {
+            throw BiliApiError.invalidRequest
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue(referer, forHTTPHeaderField: "Referer")
+        request.setValue(desktopUserAgent, forHTTPHeaderField: "User-Agent")
+
+        let cookie = cookieStore.read()
+        if !cookie.isEmpty {
+            request.setValue(cookie, forHTTPHeaderField: "Cookie")
+        }
 
         let (data, response) = try await session.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse,
