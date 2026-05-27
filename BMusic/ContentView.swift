@@ -283,8 +283,15 @@ private struct SearchScreen: View {
                         }
                     }
                 } else {
+                    Button {
+                        Task { await viewModel.playAllSearchResults() }
+                    } label: {
+                        Label("全部播放", systemImage: "play.fill")
+                    }
+                    .disabled(viewModel.results.isEmpty)
+
                     ForEach(viewModel.results) { item in
-                        MusicRow(viewModel: viewModel, item: item)
+                        SearchResultRow(viewModel: viewModel, item: item)
                             .swipeActions(edge: .leading, allowsFullSwipe: false) {
                             if let artist = item.artist {
                                 Button {
@@ -680,6 +687,11 @@ private struct LibrarySearchContent: View {
 private struct ArtistDetailScreen: View {
     @ObservedObject var viewModel: BMusicViewModel
     let artist: BMusicArtist
+    @State private var filterText = ""
+
+    private var normalizedFilter: String {
+        filterText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
 
     var body: some View {
         List {
@@ -697,11 +709,39 @@ private struct ArtistDetailScreen: View {
             }
 
             let videos = viewModel.artistVideos[artist.id] ?? []
+            let filteredVideos = filteredArtistVideos(videos)
             if videos.isEmpty && viewModel.loadingArtistID != artist.id {
                 ContentUnavailableView("还没有视频", systemImage: "person.crop.circle", description: Text("下拉刷新或稍后再试。"))
             } else {
-                ForEach(videos) { item in
-                    MusicRow(viewModel: viewModel, item: item)
+                HStack {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundStyle(.secondary)
+                    TextField("筛选当前列表", text: $filterText)
+                        .textInputAutocapitalization(.never)
+                    if !filterText.isEmpty {
+                        Button {
+                            filterText = ""
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+
+                Button {
+                    Task { await viewModel.playAllArtistVideos(filteredVideos) }
+                } label: {
+                    Label("全部播放", systemImage: "play.fill")
+                }
+                .disabled(filteredVideos.isEmpty)
+
+                if filteredVideos.isEmpty {
+                    ContentUnavailableView("没有匹配结果", systemImage: "line.3.horizontal.decrease.circle", description: Text("换个关键词试试。"))
+                } else {
+                    ForEach(filteredVideos) { item in
+                        MusicRow(viewModel: viewModel, item: item, queueContext: filteredVideos)
+                    }
                 }
             }
         }
@@ -722,6 +762,17 @@ private struct ArtistDetailScreen: View {
                 }
                 .tint(viewModel.isFavoriteArtist(artist) ? .red : .accentColor)
             }
+        }
+    }
+
+    private func filteredArtistVideos(_ videos: [BMusicVideo]) -> [BMusicVideo] {
+        guard !normalizedFilter.isEmpty else {
+            return videos
+        }
+
+        return videos.filter { item in
+            item.title.lowercased().contains(normalizedFilter)
+                || item.author.lowercased().contains(normalizedFilter)
         }
     }
 }
@@ -1344,6 +1395,26 @@ private struct MusicRow: View {
                     await viewModel.play(item)
                 }
             }
+        } favoriteAction: {
+            viewModel.toggleFavorite(item)
+        } addAction: {
+            viewModel.showPlaylistPicker(for: item)
+        }
+    }
+}
+
+private struct SearchResultRow: View {
+    @ObservedObject var viewModel: BMusicViewModel
+    let item: BMusicVideo
+
+    var body: some View {
+        VideoRow(
+            item: item,
+            isCurrent: viewModel.currentItem?.id == item.id,
+            actionSystemImage: "plus",
+            favoriteSystemImage: viewModel.isFavorite(item) ? "heart.fill" : "heart"
+        ) {
+            Task { await viewModel.playSearchResult(item) }
         } favoriteAction: {
             viewModel.toggleFavorite(item)
         } addAction: {
@@ -2095,6 +2166,7 @@ final class BMusicViewModel: ObservableObject {
     private var playbackRequestID = UUID()
     private var currentQueueIndex: Int?
     private var queueBaseline: [BMusicVideo] = []
+    private var activeSearchQueueKeyword: String?
     private var audioCacheTask: Task<Void, Never>?
 
     var canPlayNext: Bool {
@@ -2175,6 +2247,7 @@ final class BMusicViewModel: ObservableObject {
             page = 1
             hasMore = true
             results = []
+            activeSearchQueueKeyword = nil
         }
         guard hasMore, !isSearching else {
             return
@@ -2187,13 +2260,17 @@ final class BMusicViewModel: ObservableObject {
         do {
             let response = try await apiClient.search(keyword: keyword, page: page, pageSize: 20)
             let items = BMusicVideo.videos(from: response)
+            let newItems: [BMusicVideo]
             if reset {
                 results = items
+                newItems = items
             } else {
-                results.append(contentsOf: items.filter { newItem in
+                newItems = items.filter { newItem in
                     !results.contains(where: { $0.id == newItem.id })
-                })
+                }
+                results.append(contentsOf: newItems)
             }
+            appendLoadedSearchResultsToActiveQueue(newItems)
             hasMore = !items.isEmpty
             page += 1
         } catch where error.isCancellation {
@@ -2201,6 +2278,24 @@ final class BMusicViewModel: ObservableObject {
         } catch {
             errorMessage = error.localizedDescription
         }
+    }
+
+    func playAllSearchResults() async {
+        guard let first = results.first else {
+            return
+        }
+        await playSearchResult(first)
+    }
+
+    func playSearchResult(_ item: BMusicVideo) async {
+        guard !results.isEmpty else {
+            await play(item)
+            return
+        }
+
+        activeSearchQueueKeyword = normalizedSearchKeyword()
+        applyQueueContext(results, currentItem: item)
+        await play(item)
     }
 
     func refreshRecommendedKeywords(force: Bool = false) async {
@@ -2674,6 +2769,20 @@ final class BMusicViewModel: ObservableObject {
         }
     }
 
+    func playAllArtistVideos(_ artist: BMusicArtist) async {
+        guard let videos = artistVideos[artist.id], let first = videos.first else {
+            return
+        }
+        await play(first, in: videos)
+    }
+
+    func playAllArtistVideos(_ videos: [BMusicVideo]) async {
+        guard let first = videos.first else {
+            return
+        }
+        await play(first, in: videos)
+    }
+
     func showPlaylistPicker(for item: BMusicVideo) {
         playlistPickerItem = item
         showPlaylistPicker = true
@@ -2763,6 +2872,7 @@ final class BMusicViewModel: ObservableObject {
     }
 
     func play(_ item: BMusicVideo, in queueContext: [BMusicVideo]) async {
+        activeSearchQueueKeyword = nil
         let context = queueContext.contains(where: { $0.id == item.id }) ? queueContext : queueContext + [item]
         applyQueueContext(context, currentItem: item)
         await play(item)
@@ -3254,6 +3364,37 @@ final class BMusicViewModel: ObservableObject {
         }
         currentQueueIndex = queue.firstIndex { $0.id == currentItem.id }
         saveLibrary()
+    }
+
+    private func appendLoadedSearchResultsToActiveQueue(_ items: [BMusicVideo]) {
+        guard !items.isEmpty,
+              activeSearchQueueKeyword == normalizedSearchKeyword()
+        else {
+            return
+        }
+
+        if queueBaseline.isEmpty {
+            queueBaseline = queue
+        }
+
+        let newItems = Self.deduplicatedVideos(items).filter { item in
+            !queueBaseline.contains { $0.id == item.id }
+        }
+        guard !newItems.isEmpty else {
+            return
+        }
+
+        queueBaseline.append(contentsOf: newItems)
+        if playbackMode == .shuffle {
+            queue.append(contentsOf: newItems.shuffled())
+        } else {
+            queue.append(contentsOf: newItems)
+        }
+        saveLibrary()
+    }
+
+    private func normalizedSearchKeyword() -> String {
+        searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
     private func rebuildQueueForPlaybackMode() {
