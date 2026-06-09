@@ -30,10 +30,14 @@ final class NativeAudioPlayer {
     private var artworkTask: Task<Void, Never>?
     private var temporaryAudioURL: URL?
     private var playbackRequestID = UUID()
+    private static let managedTemporaryAudioPrefix = "eno-audio-"
+    private static let systemDownloadTemporaryPrefix = "CFNetworkDownload"
+    private static let staleSystemDownloadAge: TimeInterval = 300
     private let sendEvent: (String, [String: Any]) -> Void
 
     init(sendEvent: @escaping (String, [String: Any]) -> Void = { _, _ in }) {
         self.sendEvent = sendEvent
+        Self.removeStaleTemporaryAudio()
         configureRemoteCommands()
     }
 
@@ -100,7 +104,12 @@ final class NativeAudioPlayer {
         let localURL: URL
         do {
             if let cacheID {
-                localURL = try await BMusicAudioCache.shared.audioURL(for: cacheID, sourceURL: audioURL, cookie: cookie)
+                localURL = try await BMusicAudioCache.shared.audioURL(
+                    for: cacheID,
+                    sourceURL: audioURL,
+                    cookie: cookie,
+                    cancelingActivePlaybackDownload: true
+                )
             } else {
                 localURL = try await downloadTemporaryAudio(from: audioURL, cookie: cookie)
                 temporaryAudioURL = localURL
@@ -347,11 +356,54 @@ final class NativeAudioPlayer {
 
     private func removeTemporaryAudio() {
         guard let temporaryAudioURL else {
+            Self.removeStaleTemporaryAudio()
             return
         }
 
         try? FileManager.default.removeItem(at: temporaryAudioURL)
         self.temporaryAudioURL = nil
+        Self.removeStaleTemporaryAudio()
+    }
+
+    @discardableResult
+    static func removeStaleTemporaryAudio() -> (deletedFiles: Int, deletedBytes: Int64) {
+        let manager = FileManager.default
+        guard let files = try? manager.contentsOfDirectory(
+            at: manager.temporaryDirectory,
+            includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey]
+        ) else {
+            return (0, 0)
+        }
+
+        var deletedFiles = 0
+        var deletedBytes: Int64 = 0
+        for file in files where shouldRemoveTemporaryFile(file) {
+            let size = Int64((try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+            do {
+                try manager.removeItem(at: file)
+                deletedFiles += 1
+                deletedBytes += size
+            } catch {
+                continue
+            }
+        }
+        return (deletedFiles, deletedBytes)
+    }
+
+    private static func shouldRemoveTemporaryFile(_ file: URL) -> Bool {
+        let name = file.lastPathComponent
+        if name.hasPrefix(managedTemporaryAudioPrefix) {
+            return true
+        }
+
+        guard name.hasPrefix(systemDownloadTemporaryPrefix),
+              let values = try? file.resourceValues(forKeys: [.contentModificationDateKey]),
+              let modifiedAt = values.contentModificationDate
+        else {
+            return false
+        }
+
+        return Date().timeIntervalSince(modifiedAt) > staleSystemDownloadAge
     }
 
     private func sendState(_ state: String, message: String = "") {
@@ -461,6 +513,8 @@ actor BMusicAudioCache {
     private let cacheDirectory: URL
     private let indexURL: URL
     private var entries: [String: BMusicAudioCacheEntry] = [:]
+    private var activePlaybackDownloadTask: URLSessionDownloadTask?
+    private var activePlaybackDownloadToken: UUID?
 
     private init() {
         let manager = FileManager.default
@@ -472,12 +526,25 @@ actor BMusicAudioCache {
         entries = Self.loadEntries(from: directory.appendingPathComponent("index.json"))
     }
 
-    func audioURL(for id: String, sourceURL: URL, cookie: String) async throws -> URL {
+    func audioURL(
+        for id: String,
+        sourceURL: URL,
+        cookie: String,
+        cancelingActivePlaybackDownload: Bool = false
+    ) async throws -> URL {
         if let cachedURL = cachedURL(for: id) {
             return cachedURL
         }
 
-        let temporaryURL = try await downloadAudio(from: sourceURL, cookie: cookie)
+        if cancelingActivePlaybackDownload {
+            cancelActivePlaybackDownload()
+        }
+
+        let temporaryURL = try await downloadAudio(
+            from: sourceURL,
+            cookie: cookie,
+            tracksPlaybackDownload: cancelingActivePlaybackDownload
+        )
         do {
             return try storeDownloadedAudio(at: temporaryURL, for: id)
         } catch {
@@ -536,7 +603,13 @@ actor BMusicAudioCache {
         Set(entries.keys)
     }
 
-    private func downloadAudio(from audioURL: URL, cookie: String) async throws -> URL {
+    private func cancelActivePlaybackDownload() {
+        activePlaybackDownloadTask?.cancel()
+        activePlaybackDownloadTask = nil
+        activePlaybackDownloadToken = nil
+    }
+
+    private func downloadAudio(from audioURL: URL, cookie: String, tracksPlaybackDownload: Bool = false) async throws -> URL {
         var request = URLRequest(url: audioURL)
         request.timeoutInterval = 30
         for (key, value) in NativeAudioPlayer.playbackHeaders(cookie: cookie) {
@@ -544,16 +617,56 @@ actor BMusicAudioCache {
         }
 
         do {
-            let (temporaryURL, response) = try await URLSession.shared.download(for: request)
+            let (temporaryURL, response, token) = try await downloadFile(
+                request: request,
+                tracksPlaybackDownload: tracksPlaybackDownload
+            )
+            if tracksPlaybackDownload,
+               activePlaybackDownloadToken == token {
+                activePlaybackDownloadTask = nil
+                activePlaybackDownloadToken = nil
+            }
             if let httpResponse = response as? HTTPURLResponse,
                !(200...299).contains(httpResponse.statusCode) {
+                try? fileManager.removeItem(at: temporaryURL)
                 throw NativeAudioError.downloadFailed("音频下载失败 HTTP \(httpResponse.statusCode)")
             }
             return temporaryURL
         } catch let error as NativeAudioError {
             throw error
+        } catch let error as URLError where error.code == .cancelled {
+            throw CancellationError()
         } catch {
             throw NativeAudioError.downloadFailed("音频下载失败：\(error.localizedDescription)")
+        }
+    }
+
+    private func downloadFile(
+        request: URLRequest,
+        tracksPlaybackDownload: Bool
+    ) async throws -> (URL, URLResponse, UUID) {
+        try await withCheckedThrowingContinuation { continuation in
+            let token = UUID()
+            let task = URLSession.shared.downloadTask(with: request) { temporaryURL, response, error in
+                if let error {
+                    continuation.resume(throwing: error)
+                    return
+                }
+
+                guard let temporaryURL, let response else {
+                    continuation.resume(throwing: NativeAudioError.downloadFailed("音频下载失败：没有收到文件"))
+                    return
+                }
+
+                continuation.resume(returning: (temporaryURL, response, token))
+            }
+
+            if tracksPlaybackDownload {
+                activePlaybackDownloadTask = task
+                activePlaybackDownloadToken = token
+            }
+
+            task.resume()
         }
     }
 

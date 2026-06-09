@@ -741,6 +741,19 @@ private struct ArtistDetailScreen: View {
                 } else {
                     ForEach(filteredVideos) { item in
                         MusicRow(viewModel: viewModel, item: item, queueContext: filteredVideos)
+                            .task {
+                                if normalizedFilter.isEmpty {
+                                    await viewModel.loadMoreArtistVideosIfNeeded(artist, current: item)
+                                }
+                            }
+                    }
+
+                    if normalizedFilter.isEmpty, viewModel.isLoadingMoreArtistVideos(artist) {
+                        HStack {
+                            Spacer()
+                            ProgressView()
+                            Spacer()
+                        }
                     }
                 }
             }
@@ -1080,6 +1093,10 @@ private struct SettingsScreen: View {
                 Button("清空音频缓存", role: .destructive) {
                     viewModel.clearAudioCache()
                 }
+
+                Button("清理临时文件") {
+                    viewModel.clearTemporaryFiles()
+                }
             } header: {
                 Text("缓存")
             } footer: {
@@ -1107,6 +1124,7 @@ private struct SettingsScreen: View {
 
             Section("关于") {
                 LabeledContent("应用", value: "B-Music")
+                LabeledContent("版本", value: viewModel.appVersionText)
                 Text("使用 iOS 原生界面承载 ENO-M 的搜索、登录与播放能力。")
                     .foregroundStyle(.secondary)
             }
@@ -2117,6 +2135,7 @@ final class BMusicViewModel: ObservableObject {
     @Published var artistVideos: [Int: [BMusicVideo]] = [:]
     @Published var artistErrorMessages: [Int: String] = [:]
     @Published var loadingArtistID: Int?
+    @Published var loadingMoreArtistIDs: Set<Int> = []
     @Published var currentItem: BMusicVideo?
     @Published var isSearching = false
     @Published var isResolvingPlayback = false
@@ -2168,6 +2187,9 @@ final class BMusicViewModel: ObservableObject {
     private var queueBaseline: [BMusicVideo] = []
     private var activeSearchQueueKeyword: String?
     private var audioCacheTask: Task<Void, Never>?
+    private let artistVideoPageSize = 50
+    private var artistVideoPages: [Int: Int] = [:]
+    private var artistVideoHasMore: [Int: Bool] = [:]
 
     var canPlayNext: Bool {
         guard !queue.isEmpty else { return false }
@@ -2212,6 +2234,16 @@ final class BMusicViewModel: ObservableObject {
 
     var displayRecommendations: [BMusicRecommendation] {
         BMusicRecommendationStore.displayRecommendations(from: recommendations, seed: recommendationShuffleSeed)
+    }
+
+    var appVersionText: String {
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+        let versionText = version.flatMap { $0.isEmpty ? nil : $0 } ?? "未知"
+        guard let build, !build.isEmpty else {
+            return versionText
+        }
+        return "\(versionText) (\(build))"
     }
 
     init() {
@@ -2703,6 +2735,19 @@ final class BMusicViewModel: ObservableObject {
         }
     }
 
+    func clearTemporaryFiles() {
+        Task { [weak self] in
+            let result = NativeAudioPlayer.removeStaleTemporaryAudio()
+            await MainActor.run {
+                if result.deletedFiles == 0 {
+                    self?.audioCacheStatusText = "没有需要清理的临时文件。"
+                } else {
+                    self?.audioCacheStatusText = "已清理 \(result.deletedFiles) 个临时文件，释放 \(result.deletedBytes.bMusicByteSizeText)。"
+                }
+            }
+        }
+    }
+
     func refreshAudioCacheSize() {
         Task { [weak self] in
             let size = await BMusicAudioCache.shared.sizeInBytes()
@@ -2743,6 +2788,9 @@ final class BMusicViewModel: ObservableObject {
         for id in removedIDs {
             artistVideos[id] = nil
             artistErrorMessages[id] = nil
+            artistVideoPages[id] = nil
+            artistVideoHasMore[id] = nil
+            loadingMoreArtistIDs.remove(id)
         }
         saveLibrary()
     }
@@ -2751,6 +2799,9 @@ final class BMusicViewModel: ObservableObject {
         if !force, artistVideos[artist.id]?.isEmpty == false {
             return
         }
+        artistVideoPages[artist.id] = nil
+        artistVideoHasMore[artist.id] = nil
+        loadingMoreArtistIDs.remove(artist.id)
         loadingArtistID = artist.id
         artistErrorMessages[artist.id] = nil
         defer {
@@ -2760,13 +2811,50 @@ final class BMusicViewModel: ObservableObject {
         }
 
         do {
-            let response = try await apiClient.spaceVideos(mid: artist.id, page: 1, pageSize: 50)
-            artistVideos[artist.id] = BMusicVideo.spaceVideos(from: response, artist: artist)
+            let response = try await apiClient.spaceVideos(mid: artist.id, page: 1, pageSize: artistVideoPageSize)
+            let videos = BMusicVideo.spaceVideos(from: response, artist: artist)
+            artistVideos[artist.id] = videos
+            artistVideoPages[artist.id] = 1
+            artistVideoHasMore[artist.id] = videos.count == artistVideoPageSize
         } catch where error.isCancellation {
             return
         } catch {
             artistErrorMessages[artist.id] = error.localizedDescription
         }
+    }
+
+    func loadMoreArtistVideosIfNeeded(_ artist: BMusicArtist, current item: BMusicVideo) async {
+        guard item.id == artistVideos[artist.id]?.last?.id,
+              artistVideoHasMore[artist.id] != false,
+              loadingArtistID != artist.id,
+              !loadingMoreArtistIDs.contains(artist.id)
+        else {
+            return
+        }
+
+        let nextPage = (artistVideoPages[artist.id] ?? 1) + 1
+        loadingMoreArtistIDs.insert(artist.id)
+        defer { loadingMoreArtistIDs.remove(artist.id) }
+
+        do {
+            let response = try await apiClient.spaceVideos(mid: artist.id, page: nextPage, pageSize: artistVideoPageSize)
+            let videos = BMusicVideo.spaceVideos(from: response, artist: artist)
+            let existing = artistVideos[artist.id] ?? []
+            let newVideos = videos.filter { video in
+                !existing.contains { $0.id == video.id }
+            }
+            artistVideos[artist.id] = existing + newVideos
+            artistVideoPages[artist.id] = nextPage
+            artistVideoHasMore[artist.id] = videos.count == artistVideoPageSize
+        } catch where error.isCancellation {
+            return
+        } catch {
+            artistErrorMessages[artist.id] = error.localizedDescription
+        }
+    }
+
+    func isLoadingMoreArtistVideos(_ artist: BMusicArtist) -> Bool {
+        loadingMoreArtistIDs.contains(artist.id)
     }
 
     func playAllArtistVideos(_ artist: BMusicArtist) async {
