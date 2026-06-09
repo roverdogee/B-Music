@@ -1009,11 +1009,50 @@ private struct PlaylistPickerRowBackground: View {
 }
 
 private struct SettingsScreen: View {
+    private enum DestructiveAction: Identifiable {
+        case clearRecentList
+        case clearRecentCache
+        case clearAllCache
+        case clearTemporaryFiles
+
+        var id: String {
+            switch self {
+            case .clearRecentList: "clearRecentList"
+            case .clearRecentCache: "clearRecentCache"
+            case .clearAllCache: "clearAllCache"
+            case .clearTemporaryFiles: "clearTemporaryFiles"
+            }
+        }
+
+        var title: String {
+            switch self {
+            case .clearRecentList: "清空最近播放列表"
+            case .clearRecentCache: "清理最近播放缓存"
+            case .clearAllCache: "清理全部音频缓存"
+            case .clearTemporaryFiles: "清理临时播放文件"
+            }
+        }
+
+        var message: String {
+            switch self {
+            case .clearRecentList:
+                "这会清空资料库中的最近播放记录，并整理相关缓存。"
+            case .clearRecentCache:
+                "这会清理最近播放 100 首带来的音频缓存，收藏和已选播放列表缓存会保留。"
+            case .clearAllCache:
+                "这会清理最近播放、我的收藏和播放列表中的全部正式音频缓存，当前播放中的歌曲会暂时保留。"
+            case .clearTemporaryFiles:
+                "这会清理 tmp 目录中的临时播放文件和陈旧下载残留。"
+            }
+        }
+    }
+
     @ObservedObject var viewModel: BMusicViewModel
     @State private var showListExporter = false
     @State private var showListImporter = false
     @State private var listExportURLs: [URL] = []
     @State private var backupMessage: String?
+    @State private var pendingDestructiveAction: DestructiveAction?
 
     var body: some View {
         List {
@@ -1044,8 +1083,8 @@ private struct SettingsScreen: View {
                 LabeledContent("播放列表", value: "\(viewModel.playlists.count) 个")
                 LabeledContent("收藏 UP 主", value: "\(viewModel.favoriteArtists.count) 个")
                 if !viewModel.recentlyPlayed.isEmpty {
-                    Button("清空最近播放", role: .destructive) {
-                        viewModel.clearRecentlyPlayed()
+                    Button("清空最近播放列表", role: .destructive) {
+                        pendingDestructiveAction = .clearRecentList
                     }
                 }
             }
@@ -1086,16 +1125,16 @@ private struct SettingsScreen: View {
                 }
                 .disabled(!viewModel.hasConfiguredAudioCacheLists)
 
-                Button("清理未保留缓存") {
-                    viewModel.pruneAudioCache()
+                Button("清理最近播放缓存", role: .destructive) {
+                    pendingDestructiveAction = .clearRecentCache
                 }
 
-                Button("清空音频缓存", role: .destructive) {
-                    viewModel.clearAudioCache()
+                Button("清理全部音频缓存", role: .destructive) {
+                    pendingDestructiveAction = .clearAllCache
                 }
 
-                Button("清理临时文件") {
-                    viewModel.clearTemporaryFiles()
+                Button("清理临时播放文件", role: .destructive) {
+                    pendingDestructiveAction = .clearTemporaryFiles
                 }
             } header: {
                 Text("缓存")
@@ -1130,6 +1169,28 @@ private struct SettingsScreen: View {
             }
         }
         .listStyle(.insetGrouped)
+        .alert(
+            pendingDestructiveAction?.title ?? "确认操作",
+            isPresented: Binding(
+                get: { pendingDestructiveAction != nil },
+                set: { isPresented in
+                    if !isPresented {
+                        pendingDestructiveAction = nil
+                    }
+                }
+            ),
+            presenting: pendingDestructiveAction
+        ) { action in
+            Button(action.title, role: .destructive) {
+                performDestructiveAction(action)
+                pendingDestructiveAction = nil
+            }
+            Button("取消", role: .cancel) {
+                pendingDestructiveAction = nil
+            }
+        } message: { action in
+            Text(action.message)
+        }
         .sheet(isPresented: $showListExporter) {
             BMusicDocumentExporter(urls: listExportURLs) { result in
                 showListExporter = false
@@ -1160,6 +1221,19 @@ private struct SettingsScreen: View {
             }
         } message: {
             Text(backupMessage ?? "")
+        }
+    }
+
+    private func performDestructiveAction(_ action: DestructiveAction) {
+        switch action {
+        case .clearRecentList:
+            viewModel.clearRecentlyPlayed()
+        case .clearRecentCache:
+            viewModel.clearRecentPlayAudioCache()
+        case .clearAllCache:
+            viewModel.clearAllAudioCache()
+        case .clearTemporaryFiles:
+            viewModel.clearTemporaryPlaybackFiles()
         }
     }
 
@@ -2722,7 +2796,27 @@ final class BMusicViewModel: ObservableObject {
         }
     }
 
-    func clearAudioCache() {
+    func clearRecentPlayAudioCache() {
+        let recentIDs = Set(recentlyPlayed.prefix(100).map(\.id))
+        guard !recentIDs.isEmpty else {
+            audioCacheStatusText = "最近播放里没有可清理的音频缓存。"
+            return
+        }
+
+        let protectedIDs = configuredAudioCacheIDs().union(currentItem.map { Set([$0.id]) } ?? [])
+        Task { [weak self, recentIDs, protectedIDs] in
+            let cachedIDs = await BMusicAudioCache.shared.cachedIDs()
+            let keepIDs = cachedIDs.subtracting(recentIDs.subtracting(protectedIDs))
+            await BMusicAudioCache.shared.prune(keeping: keepIDs)
+            let size = await BMusicAudioCache.shared.sizeInBytes()
+            await MainActor.run {
+                self?.audioCacheSizeText = size.bMusicByteSizeText
+                self?.audioCacheStatusText = "已清理最近播放缓存，收藏和已选播放列表缓存已保留。"
+            }
+        }
+    }
+
+    func clearAllAudioCache() {
         audioCacheTask?.cancel()
         let keepIDs = currentItem.map { Set([$0.id]) } ?? []
         Task { [weak self, keepIDs] in
@@ -2730,19 +2824,19 @@ final class BMusicViewModel: ObservableObject {
             let size = await BMusicAudioCache.shared.sizeInBytes()
             await MainActor.run {
                 self?.audioCacheSizeText = size.bMusicByteSizeText
-                self?.audioCacheStatusText = keepIDs.isEmpty ? "音频缓存已清空。" : "已清空缓存，当前播放中的歌曲暂时保留。"
+                self?.audioCacheStatusText = keepIDs.isEmpty ? "全部音频缓存已清理。" : "全部音频缓存已清理，当前播放中的歌曲暂时保留。"
             }
         }
     }
 
-    func clearTemporaryFiles() {
+    func clearTemporaryPlaybackFiles() {
         Task { [weak self] in
             let result = NativeAudioPlayer.removeStaleTemporaryAudio()
             await MainActor.run {
                 if result.deletedFiles == 0 {
-                    self?.audioCacheStatusText = "没有需要清理的临时文件。"
+                    self?.audioCacheStatusText = "没有需要清理的临时播放文件。"
                 } else {
-                    self?.audioCacheStatusText = "已清理 \(result.deletedFiles) 个临时文件，释放 \(result.deletedBytes.bMusicByteSizeText)。"
+                    self?.audioCacheStatusText = "已清理 \(result.deletedFiles) 个临时播放文件，释放 \(result.deletedBytes.bMusicByteSizeText)。"
                 }
             }
         }
@@ -3271,12 +3365,16 @@ final class BMusicViewModel: ObservableObject {
         return Self.deduplicatedVideos(items)
     }
 
+    private func configuredAudioCacheIDs() -> Set<String> {
+        Set(configuredAudioCacheItems().map(\.id))
+    }
+
     private func audioCacheKeepIDs() -> Set<String> {
         var ids = Set<String>()
         if cachesRecentPlays {
             ids.formUnion(recentlyPlayed.prefix(100).map(\.id))
         }
-        ids.formUnion(configuredAudioCacheItems().map(\.id))
+        ids.formUnion(configuredAudioCacheIDs())
         if let currentItem {
             ids.insert(currentItem.id)
         }
