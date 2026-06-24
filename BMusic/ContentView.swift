@@ -216,7 +216,7 @@ private struct SearchScreen: View {
                 HStack {
                     Image(systemName: "magnifyingglass")
                         .foregroundStyle(.secondary)
-                    TextField("搜索 B 站音乐、歌手、视频", text: $viewModel.searchText)
+                    TextField("搜索音乐，或粘贴 BV 号 / B 站链接", text: $viewModel.searchText)
                         .textInputAutocapitalization(.never)
                         .submitLabel(.search)
                         .onSubmit {
@@ -343,7 +343,7 @@ private struct QuickSearchBar: View {
                 Image(systemName: "magnifyingglass")
                     .foregroundStyle(.secondary)
 
-                TextField("搜索 B 站音乐", text: $text)
+                TextField("搜索音乐，或粘贴 BV 号 / B 站链接", text: $text)
                     .textInputAutocapitalization(.never)
                     .submitLabel(.search)
                     .focused($isFocused)
@@ -1071,10 +1071,18 @@ private struct SettingsScreen: View {
                 }
             }
 
-            Section("播放") {
+            Section {
                 LabeledContent("当前状态", value: viewModel.playbackStateText)
                 LabeledContent("播放模式", value: viewModel.playbackMode.title)
                 LabeledContent("播放来源", value: "Bilibili")
+                Toggle("音量平衡", isOn: $viewModel.balancesVolume)
+                    .onChange(of: viewModel.balancesVolume) { _, enabled in
+                        viewModel.setBalancesVolume(enabled)
+                    }
+            } header: {
+                Text("播放")
+            } footer: {
+                Text("分析本地音频的平均响度并自动调整播放增益，减小连续切歌时忽大忽小的差异。")
             }
 
             Section("资料库") {
@@ -2229,6 +2237,7 @@ final class BMusicViewModel: ObservableObject {
     @Published var showPlayer = false
     @Published var showQueueInPlayer = true
     @Published var playbackMode: BMusicPlaybackMode = .listLoop
+    @Published var balancesVolume = true
     @Published var showPlaylistPicker = false
     @Published var playlistPickerItem: BMusicVideo?
     @Published var cachesRecentPlays = true
@@ -2251,6 +2260,7 @@ final class BMusicViewModel: ObservableObject {
     private var audioPlayer: NativeAudioPlayer!
     private let libraryStore = BMusicLibraryStore()
     private let cachePreferencesStore = BMusicCachePreferencesStore()
+    private let playbackPreferencesStore = BMusicPlaybackPreferencesStore()
     private let recommendationStore = BMusicRecommendationStore()
     private var page = 1
     private var hasMore = true
@@ -2261,6 +2271,10 @@ final class BMusicViewModel: ObservableObject {
     private var queueBaseline: [BMusicVideo] = []
     private var activeSearchQueueKeyword: String?
     private var audioCacheTask: Task<Void, Never>?
+    private var playbackRecoveryTask: Task<Void, Never>?
+    private var nextAudioPrefetchTask: Task<Void, Never>?
+    private var prefetchedAudioIDs: Set<String> = []
+    private var prefetchingAudioIDs: Set<String> = []
     private let artistVideoPageSize = 50
     private var artistVideoPages: [Int: Int] = [:]
     private var artistVideoHasMore: [Int: Bool] = [:]
@@ -2328,6 +2342,7 @@ final class BMusicViewModel: ObservableObject {
         }
         restoreLibrary()
         restoreCachePreferences()
+        restorePlaybackPreferences()
         refreshAudioCacheSize()
     }
 
@@ -2364,6 +2379,11 @@ final class BMusicViewModel: ObservableObject {
         defer { isSearching = false }
 
         do {
+            if reset, let bvid = try await apiClient.resolveBVID(from: keyword) {
+                try await openDirectVideo(bvid: bvid)
+                return
+            }
+
             let response = try await apiClient.search(keyword: keyword, page: page, pageSize: 20)
             let items = BMusicVideo.videos(from: response)
             let newItems: [BMusicVideo]
@@ -2719,6 +2739,12 @@ final class BMusicViewModel: ObservableObject {
         pruneAudioCache()
     }
 
+    func setBalancesVolume(_ enabled: Bool) {
+        balancesVolume = enabled
+        playbackPreferencesStore.save(BMusicPlaybackPreferences(balancesVolume: enabled))
+        audioPlayer.setVolumeBalancingEnabled(enabled)
+    }
+
     func setCachesFavorites(_ enabled: Bool) {
         cachesFavorites = enabled
         saveCachePreferences()
@@ -3061,8 +3087,18 @@ final class BMusicViewModel: ObservableObject {
     }
 
     func play(_ item: BMusicVideo) async {
+        await startPlayback(item, automaticRetry: false)
+    }
+
+    private func startPlayback(_ item: BMusicVideo, automaticRetry: Bool) async {
         let requestID = UUID()
         playbackRequestID = requestID
+        playbackRecoveryTask?.cancel()
+        nextAudioPrefetchTask?.cancel()
+        nextAudioPrefetchTask = nil
+        if !automaticRetry {
+            errorMessage = ""
+        }
 
         if queueBaseline.isEmpty {
             queueBaseline = queue
@@ -3078,9 +3114,9 @@ final class BMusicViewModel: ObservableObject {
         currentItem = item
         isResolvingPlayback = true
         playbackStateText = "加载中"
-        playbackDetail = "正在获取音频地址..."
-        playbackProgress.reset(detail: "正在获取音频地址...")
-        errorMessage = ""
+        let loadingDetail = automaticRetry ? "正在重新连接..." : "正在获取音频地址..."
+        playbackDetail = loadingDetail
+        playbackProgress.reset(detail: loadingDetail)
         defer {
             if isCurrentPlaybackRequest(requestID) {
                 isResolvingPlayback = false
@@ -3101,6 +3137,7 @@ final class BMusicViewModel: ObservableObject {
                 addRecentlyPlayed(item)
                 playbackDetail = "使用本地缓存播放"
                 playbackProgress.reset(detail: "使用本地缓存播放")
+                maybePrefetchNextAudio(position: playbackProgress.position, duration: playbackProgress.duration)
                 return
             }
 
@@ -3137,6 +3174,7 @@ final class BMusicViewModel: ObservableObject {
             playbackDetail = error.localizedDescription
             playbackProgress.reset(detail: error.localizedDescription)
             errorMessage = error.localizedDescription
+            schedulePlaybackRecovery(for: item, requestID: requestID, message: "播放失败，10 秒后自动重试...")
         }
     }
 
@@ -3156,6 +3194,7 @@ final class BMusicViewModel: ObservableObject {
 
     func togglePlayPause() {
         if isPlaying {
+            cancelPlaybackRecovery()
             _ = audioPlayer.pause()
         } else {
             _ = audioPlayer.resume()
@@ -3169,10 +3208,90 @@ final class BMusicViewModel: ObservableObject {
     private func cancelPendingPlayback() {
         playbackRequestID = UUID()
         isResolvingPlayback = false
+        playbackRecoveryTask?.cancel()
+        nextAudioPrefetchTask?.cancel()
+        playbackRecoveryTask = nil
+        nextAudioPrefetchTask = nil
     }
 
     private func isCurrentPlaybackRequest(_ requestID: UUID) -> Bool {
         playbackRequestID == requestID
+    }
+
+    private func schedulePlaybackRecovery(for item: BMusicVideo, requestID: UUID, message: String) {
+        guard isCurrentPlaybackRequest(requestID) else {
+            return
+        }
+
+        playbackRecoveryTask?.cancel()
+        playbackDetail = message
+        playbackRecoveryTask = Task { [weak self, requestID, item] in
+            do {
+                try await Task.sleep(nanoseconds: 10_000_000_000)
+            } catch {
+                return
+            }
+
+            await self?.retryPlaybackIfStillCurrent(item, requestID: requestID)
+        }
+    }
+
+    private func retryPlaybackIfStillCurrent(_ item: BMusicVideo, requestID: UUID) async {
+        guard isCurrentPlaybackRequest(requestID),
+              currentItem?.id == item.id
+        else {
+            return
+        }
+
+        await startPlayback(item, automaticRetry: true)
+    }
+
+    private func cancelPlaybackRecovery() {
+        playbackRecoveryTask?.cancel()
+        playbackRecoveryTask = nil
+    }
+
+    private func maybePrefetchNextAudio(position: Double, duration: Double) {
+        guard duration.isFinite,
+              duration > 0,
+              position >= duration * 0.5,
+              playbackMode != .repeatOne,
+              let currentItem,
+              let next = nextQueueItem(),
+              next.id != currentItem.id,
+              !prefetchedAudioIDs.contains(next.id),
+              !prefetchingAudioIDs.contains(next.id)
+        else {
+            return
+        }
+
+        prefetchingAudioIDs.insert(next.id)
+        nextAudioPrefetchTask = Task { [weak self, next] in
+            guard let self else { return }
+            defer {
+                Task { @MainActor [weak self] in
+                    self?.prefetchingAudioIDs.remove(next.id)
+                    self?.nextAudioPrefetchTask = nil
+                }
+            }
+
+            if await BMusicAudioCache.shared.cachedURL(for: next.id) != nil {
+                await MainActor.run {
+                    _ = self.prefetchedAudioIDs.insert(next.id)
+                }
+                return
+            }
+
+            do {
+                try await self.cacheAudio(next)
+                await MainActor.run {
+                    _ = self.prefetchedAudioIDs.insert(next.id)
+                    self.refreshAudioCacheSize()
+                }
+            } catch {
+                return
+            }
+        }
     }
 
     func cyclePlaybackMode() {
@@ -3396,6 +3515,12 @@ final class BMusicViewModel: ObservableObject {
         cachesRecentPlays = preferences.cachesRecentPlays
         cachesFavorites = preferences.cachesFavorites
         cachedPlaylistIDs = Set(preferences.cachedPlaylistIDs)
+    }
+
+    private func restorePlaybackPreferences() {
+        let preferences = playbackPreferencesStore.load()
+        balancesVolume = preferences.balancesVolume
+        audioPlayer.setVolumeBalancingEnabled(preferences.balancesVolume)
     }
 
     private func saveLibrary() {
@@ -3656,6 +3781,26 @@ final class BMusicViewModel: ObservableObject {
         return (video, audioURL)
     }
 
+    private func openDirectVideo(bvid: String) async throws {
+        let fallback = BMusicVideo.placeholder(bvid: bvid)
+        let response = try await apiClient.request(payload: [
+            "contentScriptQuery": "getVideoInfo",
+            "bvid": bvid
+        ])
+        guard let video = BMusicVideo.detail(from: response, fallback: fallback),
+              video.cid != nil
+        else {
+            throw BMusicError.invalidVideo
+        }
+
+        results = [video]
+        hasMore = false
+        page = 1
+        activeSearchQueueKeyword = nil
+        applyQueueContext([video], currentItem: video)
+        await play(video)
+    }
+
     private func handleAudioEvent(_ event: String, payload: [String: Any]) {
         switch event {
         case "native-audio-state":
@@ -3670,7 +3815,14 @@ final class BMusicViewModel: ObservableObject {
                 detail: message.isEmpty ? nil : message
             )
             if state == "ended" {
+                cancelPlaybackRecovery()
                 handlePlaybackEnded()
+            } else if state == "buffering", let currentItem {
+                schedulePlaybackRecovery(for: currentItem, requestID: playbackRequestID, message: "网络卡顿，10 秒后自动重连...")
+            } else if state == "failed", let currentItem {
+                schedulePlaybackRecovery(for: currentItem, requestID: playbackRequestID, message: "播放失败，10 秒后自动重试...")
+            } else if state == "playing" || state == "ready" {
+                cancelPlaybackRecovery()
             }
         case "native-audio-progress":
             let position = payload["position"] as? Double ?? 0
@@ -3679,6 +3831,10 @@ final class BMusicViewModel: ObservableObject {
                 isPlaying = nextIsPlaying
             }
             playbackProgress.update(position: position, duration: duration)
+            if isPlaying {
+                cancelPlaybackRecovery()
+            }
+            maybePrefetchNextAudio(position: position, duration: duration)
         case "native-audio-command":
             if payload["command"] as? String == "next" {
                 Task { await playNext() }
@@ -3701,6 +3857,26 @@ struct BMusicVideo: Codable, Identifiable, Hashable {
     var cover: String
     var duration: String
 
+    private init(
+        id: String,
+        bvid: String,
+        cid: Int?,
+        title: String,
+        author: String,
+        authorID: Int?,
+        cover: String,
+        duration: String
+    ) {
+        self.id = id
+        self.bvid = bvid
+        self.cid = cid
+        self.title = title
+        self.author = author
+        self.authorID = authorID
+        self.cover = cover
+        self.duration = duration
+    }
+
     var coverURL: URL? {
         let normalized: String
         if cover.hasPrefix("//") {
@@ -3722,6 +3898,19 @@ struct BMusicVideo: Codable, Identifiable, Hashable {
             return nil
         }
         return BMusicArtist(id: authorID, name: author)
+    }
+
+    static func placeholder(bvid: String) -> BMusicVideo {
+        BMusicVideo(
+            id: bvid,
+            bvid: bvid,
+            cid: nil,
+            title: bvid,
+            author: "",
+            authorID: nil,
+            cover: "",
+            duration: ""
+        )
     }
 
     static func videos(from response: Any) -> [BMusicVideo] {
@@ -3947,11 +4136,14 @@ struct BMusicPlaylist: Codable, Identifiable, Hashable {
 }
 
 enum BMusicError: LocalizedError {
+    case invalidVideo
     case missingCID
     case missingAudioURL
 
     var errorDescription: String? {
         switch self {
+        case .invalidVideo:
+            return "没有找到这个 BV 号对应的视频。"
         case .missingCID:
             return "没有拿到视频 CID，无法解析音频。"
         case .missingAudioURL:
@@ -4319,6 +4511,35 @@ struct BMusicCachePreferences: Codable {
     var cachesRecentPlays = true
     var cachesFavorites = false
     var cachedPlaylistIDs: [UUID] = []
+}
+
+struct BMusicPlaybackPreferences: Codable {
+    var balancesVolume = true
+}
+
+final class BMusicPlaybackPreferencesStore {
+    private let key = "b-music-playback-preferences-v1"
+    private let defaults: UserDefaults
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+    }
+
+    func load() -> BMusicPlaybackPreferences {
+        guard let data = defaults.data(forKey: key),
+              let preferences = try? JSONDecoder().decode(BMusicPlaybackPreferences.self, from: data)
+        else {
+            return BMusicPlaybackPreferences()
+        }
+        return preferences
+    }
+
+    func save(_ preferences: BMusicPlaybackPreferences) {
+        guard let data = try? JSONEncoder().encode(preferences) else {
+            return
+        }
+        defaults.set(data, forKey: key)
+    }
 }
 
 final class BMusicCachePreferencesStore {

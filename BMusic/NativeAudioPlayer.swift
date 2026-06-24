@@ -30,6 +30,8 @@ final class NativeAudioPlayer {
     private var artworkTask: Task<Void, Never>?
     private var temporaryAudioURL: URL?
     private var playbackRequestID = UUID()
+    private var volumeBalancingEnabled = true
+    private var balancedVolumes: [String: Float] = [:]
     private static let managedTemporaryAudioPrefix = "eno-audio-"
     private static let systemDownloadTemporaryPrefix = "CFNetworkDownload"
     private static let staleSystemDownloadAge: TimeInterval = 300
@@ -39,6 +41,11 @@ final class NativeAudioPlayer {
         self.sendEvent = sendEvent
         Self.removeStaleTemporaryAudio()
         configureRemoteCommands()
+    }
+
+    func setVolumeBalancingEnabled(_ enabled: Bool) {
+        volumeBalancingEnabled = enabled
+        player?.volume = enabled ? (player?.volume ?? 1) : 1
     }
 
     func playCached(cacheID: String, title: String?, artist: String?, artworkURL: String?) async throws -> Bool {
@@ -69,6 +76,11 @@ final class NativeAudioPlayer {
 
         let item = AVPlayerItem(url: localURL)
         let player = AVPlayer(playerItem: item)
+        let volume = await playbackVolume(for: localURL, requestID: requestID)
+        guard isCurrentPlaybackRequest(requestID) else {
+            throw CancellationError()
+        }
+        player.volume = volume
         self.playerItem = item
         self.player = player
         observe(item: item, player: player)
@@ -129,6 +141,11 @@ final class NativeAudioPlayer {
 
         let item = AVPlayerItem(url: localURL)
         let player = AVPlayer(playerItem: item)
+        let volume = await playbackVolume(for: localURL, requestID: requestID)
+        guard isCurrentPlaybackRequest(requestID) else {
+            throw CancellationError()
+        }
+        player.volume = volume
         self.playerItem = item
         self.player = player
         observe(item: item, player: player)
@@ -191,6 +208,105 @@ final class NativeAudioPlayer {
 
     private func isCurrentPlaybackRequest(_ requestID: UUID) -> Bool {
         playbackRequestID == requestID
+    }
+
+    private func playbackVolume(for url: URL, requestID: UUID) async -> Float {
+        guard volumeBalancingEnabled else {
+            return 1
+        }
+
+        let cacheKey = url.path
+        if let cached = balancedVolumes[cacheKey] {
+            return cached
+        }
+
+        let measuredDB = await Task.detached(priority: .userInitiated) {
+            Self.estimateLoudnessDB(for: url)
+        }.value
+        guard isCurrentPlaybackRequest(requestID), volumeBalancingEnabled else {
+            return 1
+        }
+
+        let volume = Self.balancedPlaybackVolume(measuredDB: measuredDB)
+        balancedVolumes[cacheKey] = volume
+        return volume
+    }
+
+    private static func estimateLoudnessDB(for url: URL) -> Double? {
+        guard let file = try? AVAudioFile(forReading: url) else {
+            return nil
+        }
+
+        let format = file.processingFormat
+        let sampleRate = format.sampleRate
+        guard sampleRate > 0, file.length > 0 else {
+            return nil
+        }
+
+        let windowFrames = AVAudioFrameCount(min(sampleRate * 0.4, Double(UInt32.max)))
+        guard windowFrames > 0 else {
+            return nil
+        }
+
+        let windowCount = 9
+        let maximumStart = max(0, file.length - AVAudioFramePosition(windowFrames))
+        var windowEnergies: [Double] = []
+
+        for index in 0..<windowCount {
+            let fraction = Double(index + 1) / Double(windowCount + 1)
+            file.framePosition = AVAudioFramePosition(Double(maximumStart) * fraction)
+            guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: windowFrames) else {
+                continue
+            }
+
+            do {
+                try file.read(into: buffer, frameCount: windowFrames)
+            } catch {
+                continue
+            }
+
+            guard buffer.frameLength > 0,
+                  let channels = buffer.floatChannelData
+            else {
+                continue
+            }
+
+            var sumSquares = 0.0
+            let frameLength = Int(buffer.frameLength)
+            let channelCount = Int(format.channelCount)
+            for channel in 0..<channelCount {
+                let samples = channels[channel]
+                for frame in 0..<frameLength {
+                    let sample = Double(samples[frame])
+                    sumSquares += sample * sample
+                }
+            }
+
+            let sampleCount = max(1, frameLength * channelCount)
+            let energy = sumSquares / Double(sampleCount)
+            if energy > 0.000_000_1 {
+                windowEnergies.append(energy)
+            }
+        }
+
+        guard !windowEnergies.isEmpty else {
+            return nil
+        }
+
+        let sorted = windowEnergies.sorted(by: >)
+        let retainedCount = max(1, Int(ceil(Double(sorted.count) * 0.6)))
+        let gatedEnergy = sorted.prefix(retainedCount).reduce(0, +) / Double(retainedCount)
+        return 10 * log10(gatedEnergy)
+    }
+
+    private static func balancedPlaybackVolume(measuredDB: Double?) -> Float {
+        guard let measuredDB, measuredDB.isFinite else {
+            return 1
+        }
+
+        let targetDB = -15.0
+        let gain = pow(10, (targetDB - measuredDB) / 20)
+        return Float(min(1, max(0.72, gain)))
     }
 
     private func observe(item: AVPlayerItem, player: AVPlayer) {

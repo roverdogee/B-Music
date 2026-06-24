@@ -232,6 +232,36 @@ final class BiliApiClient {
         }
     }
 
+    func resolveBVID(from input: String) async throws -> String? {
+        if let bvid = Self.firstBVID(in: input) {
+            return bvid
+        }
+
+        guard let url = Self.firstBilibiliURL(in: input),
+              let host = url.host?.lowercased(),
+              host == "b23.tv" || host.hasSuffix(".b23.tv")
+        else {
+            return nil
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.timeoutInterval = 15
+        request.setValue(desktopUserAgent, forHTTPHeaderField: "User-Agent")
+        request.setValue("https://www.bilibili.com/", forHTTPHeaderField: "Referer")
+
+        let (data, response) = try await session.data(for: request)
+        if let finalURL = response.url,
+           let bvid = Self.firstBVID(in: finalURL.absoluteString) {
+            return bvid
+        }
+
+        guard let pageText = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+        return Self.firstBVID(in: pageText)
+    }
+
     func spaceVideos(mid: Int, page: Int = 1, pageSize: Int = 30) async throws -> Any {
         let params: [String: Any] = [
             "mid": mid,
@@ -406,6 +436,38 @@ final class BiliApiClient {
                 with: "w_rid=<redacted>",
                 options: .regularExpression
             )
+    }
+
+    private static func firstBVID(in value: String) -> String? {
+        guard let regex = try? NSRegularExpression(pattern: #"(?i)BV[0-9A-Za-z]{10}"#),
+              let match = regex.firstMatch(
+                in: value,
+                range: NSRange(value.startIndex..<value.endIndex, in: value)
+              ),
+              let range = Range(match.range, in: value)
+        else {
+            return nil
+        }
+
+        let matched = String(value[range])
+        return "BV" + matched.dropFirst(2)
+    }
+
+    private static func firstBilibiliURL(in value: String) -> URL? {
+        guard let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.link.rawValue) else {
+            return nil
+        }
+
+        let range = NSRange(value.startIndex..<value.endIndex, in: value)
+        return detector.matches(in: value, range: range).compactMap(\.url).first { url in
+            guard let host = url.host?.lowercased() else {
+                return false
+            }
+            return host == "b23.tv"
+                || host.hasSuffix(".b23.tv")
+                || host == "bilibili.com"
+                || host.hasSuffix(".bilibili.com")
+        }
     }
 
     private func endpoint(for query: String) throws -> BiliEndpoint {
