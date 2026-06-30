@@ -189,12 +189,13 @@ final class BiliApiClient {
         return report
     }
 
-    func search(keyword: String, page: Int = 1, pageSize: Int = 20) async throws -> Any {
+    func search(keyword: String, page: Int = 1, pageSize: Int = 20, order: BMusicResultSort = .default) async throws -> Any {
         let searchEndpoint = try endpoint(for: "search")
         var params = searchEndpoint.defaults
         params["keyword"] = keyword
         params["page"] = page
         params["page_size"] = pageSize
+        params["order"] = order.biliSearchOrder
 
         let cookie = cookieStore.read()
         var components = URLComponents(url: baseURL.appendingPathComponent(searchEndpoint.path), resolvingAgainstBaseURL: false)
@@ -262,14 +263,14 @@ final class BiliApiClient {
         return Self.firstBVID(in: pageText)
     }
 
-    func spaceVideos(mid: Int, page: Int = 1, pageSize: Int = 30) async throws -> Any {
+    func spaceVideos(mid: Int, page: Int = 1, pageSize: Int = 30, order: BMusicResultSort = .latest) async throws -> Any {
         let params: [String: Any] = [
             "mid": mid,
             "pn": page,
             "ps": pageSize,
             "tid": 0,
             "keyword": "",
-            "order": "pubdate",
+            "order": order.biliSpaceOrder,
             "platform": "web",
             "web_location": 1550101
         ]

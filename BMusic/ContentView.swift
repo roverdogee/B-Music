@@ -6,7 +6,6 @@ import WebKit
 struct ContentView: View {
     @StateObject private var viewModel = BMusicViewModel()
     @State private var selectedTab: BMusicTab = .search
-    @State private var libraryEditMode: EditMode = .inactive
     @State private var showQuickSearch = false
     @State private var quickSearchText = ""
 
@@ -23,15 +22,8 @@ struct ContentView: View {
             .tag(BMusicTab.search)
 
             NavigationStack {
-                LibraryScreen(viewModel: viewModel) { query in
-                    libraryEditMode = .inactive
-                    viewModel.searchText = query
-                    selectedTab = .search
-                    Task { await viewModel.search(reset: true) }
-                }
-                .navigationTitle("资料库")
+                LibraryScreen(viewModel: viewModel)
             }
-            .environment(\.editMode, $libraryEditMode)
             .miniPlayerInset(viewModel: viewModel)
             .tabItem {
                 Label("资料库", systemImage: "music.note.list")
@@ -165,6 +157,45 @@ private enum BMusicTab: Hashable {
     case quickSearch
 }
 
+enum BMusicResultSort: String, CaseIterable, Identifiable {
+    case `default`
+    case latest
+    case mostPlayed
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .default:
+            return "综合"
+        case .latest:
+            return "最新"
+        case .mostPlayed:
+            return "播放最多"
+        }
+    }
+
+    var biliSearchOrder: String {
+        switch self {
+        case .default:
+            return "totalrank"
+        case .latest:
+            return "pubdate"
+        case .mostPlayed:
+            return "click"
+        }
+    }
+
+    var biliSpaceOrder: String {
+        switch self {
+        case .default, .latest:
+            return "pubdate"
+        case .mostPlayed:
+            return "click"
+        }
+    }
+}
+
 private struct QuickSearchDock<Content: View>: View {
     @ViewBuilder var content: Content
 
@@ -246,7 +277,7 @@ private struct SearchScreen: View {
             }
 
             Section {
-                if viewModel.results.isEmpty {
+                if viewModel.results.isEmpty && !viewModel.hasSearchContext {
                     if viewModel.weeklyChartItems.isEmpty {
                         if viewModel.isLoadingWeeklyChart {
                             HStack {
@@ -282,7 +313,37 @@ private struct SearchScreen: View {
                             )
                         }
                     }
+                } else if viewModel.results.isEmpty {
+                    Picker("排序", selection: $viewModel.searchSort) {
+                        ForEach(BMusicResultSort.allCases) { sort in
+                            Text(sort.title).tag(sort)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .onChange(of: viewModel.searchSort) { _, _ in
+                        viewModel.sortLoadedSearchResults()
+                    }
+
+                    if viewModel.isSearching {
+                        HStack {
+                            Spacer()
+                            ProgressView("正在加载搜索结果")
+                            Spacer()
+                        }
+                    } else {
+                        ContentUnavailableView("没有搜索结果", systemImage: "music.magnifyingglass", description: Text("换个关键词或排序方式试试。"))
+                    }
                 } else {
+                    Picker("排序", selection: $viewModel.searchSort) {
+                        ForEach(BMusicResultSort.allCases) { sort in
+                            Text(sort.title).tag(sort)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .onChange(of: viewModel.searchSort) { _, _ in
+                        viewModel.sortLoadedSearchResults()
+                    }
+
                     Button {
                         Task { await viewModel.playAllSearchResults() }
                     } label: {
@@ -492,65 +553,55 @@ private struct FlowLayout: Layout {
     }
 }
 
+private enum LibrarySection: String, CaseIterable, Identifiable {
+    case playlists = "播放列表"
+    case following = "我的关注"
+
+    var id: String { rawValue }
+}
+
 private struct LibraryScreen: View {
     @ObservedObject var viewModel: BMusicViewModel
-    let searchBilibili: (String) -> Void
-    @Environment(\.editMode) private var editMode
-    @State private var librarySearchText = ""
+    @State private var selectedSection: LibrarySection = .playlists
     @State private var showNewPlaylist = false
     @State private var newPlaylistName = ""
 
-    private var isEditing: Bool {
-        editMode?.wrappedValue.isEditing == true
-    }
-
-    private var searchQuery: String {
-        librarySearchText.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private var librarySearchResults: [BMusicVideo] {
-        viewModel.librarySearchResults(matching: searchQuery)
-    }
-
-    private var libraryArtistResults: [BMusicArtist] {
-        viewModel.libraryArtistSearchResults(matching: searchQuery)
+    private var selectedSectionBinding: Binding<LibrarySection> {
+        Binding(
+            get: { selectedSection },
+            set: { selectSection($0) }
+        )
     }
 
     var body: some View {
-        List {
-            if searchQuery.isEmpty {
-                LibraryHomeContent(viewModel: viewModel)
-            } else {
-                LibrarySearchContent(
+        VStack(spacing: 0) {
+            LibrarySectionPicker(selectedSection: selectedSectionBinding)
+                .padding(.horizontal)
+                .padding(.top, 8)
+                .padding(.bottom, 6)
+                .background(Color(.systemGroupedBackground))
+
+            TabView(selection: selectedSectionBinding) {
+                LibrarySectionPage(
                     viewModel: viewModel,
-                    query: searchQuery,
-                    results: librarySearchResults,
-                    artists: libraryArtistResults,
-                    searchBilibili: searchBilibili
+                    section: .playlists,
+                    showNewPlaylist: $showNewPlaylist,
+                    newPlaylistName: $newPlaylistName
                 )
+                .tag(LibrarySection.playlists)
+
+                LibrarySectionPage(
+                    viewModel: viewModel,
+                    section: .following,
+                    showNewPlaylist: $showNewPlaylist,
+                    newPlaylistName: $newPlaylistName
+                )
+                .tag(LibrarySection.following)
             }
+            .tabViewStyle(.page(indexDisplayMode: .never))
         }
-        .listStyle(.insetGrouped)
-        .searchable(text: $librarySearchText, placement: .navigationBarDrawer(displayMode: .always), prompt: "搜索资料库音乐和 UP 主")
-        .toolbar {
-            ToolbarItem(placement: .topBarLeading) {
-                if !viewModel.recentlyPlayed.isEmpty || !viewModel.playlists.isEmpty || !viewModel.favoriteArtists.isEmpty {
-                    Button(isEditing ? "完成" : "编辑") {
-                        withAnimation {
-                            editMode?.wrappedValue = isEditing ? .inactive : .active
-                        }
-                    }
-                }
-            }
-            ToolbarItem(placement: .topBarTrailing) {
-                Button {
-                    newPlaylistName = ""
-                    showNewPlaylist = true
-                } label: {
-                    Label("新建播放列表", systemImage: "plus")
-                }
-            }
-        }
+        .background(Color(.systemGroupedBackground))
+        .navigationTitle("资料库")
         .alert("新建播放列表", isPresented: $showNewPlaylist) {
             TextField("名称", text: $newPlaylistName)
             Button("取消", role: .cancel) {}
@@ -561,73 +612,130 @@ private struct LibraryScreen: View {
             Text("给这个列表起个名字。")
         }
     }
+
+    private func selectSection(_ section: LibrarySection) {
+        guard section != selectedSection else {
+            return
+        }
+
+        withAnimation(.snappy(duration: 0.28)) {
+            selectedSection = section
+        }
+    }
+}
+
+private struct LibrarySectionPage: View {
+    @ObservedObject var viewModel: BMusicViewModel
+    let section: LibrarySection
+    @Binding var showNewPlaylist: Bool
+    @Binding var newPlaylistName: String
+
+    var body: some View {
+        List {
+            LibraryHomeContent(
+                viewModel: viewModel,
+                selectedSection: section,
+                showNewPlaylist: $showNewPlaylist,
+                newPlaylistName: $newPlaylistName
+            )
+        }
+        .listStyle(.insetGrouped)
+    }
+}
+
+private struct LibrarySectionPicker: View {
+    @Binding var selectedSection: LibrarySection
+
+    var body: some View {
+        Picker("资料库分类", selection: $selectedSection) {
+            ForEach(LibrarySection.allCases) { section in
+                Text(section.rawValue).tag(section)
+            }
+        }
+        .pickerStyle(.segmented)
+    }
 }
 
 private struct LibraryHomeContent: View {
     @ObservedObject var viewModel: BMusicViewModel
+    let selectedSection: LibrarySection
+    @Binding var showNewPlaylist: Bool
+    @Binding var newPlaylistName: String
 
     var body: some View {
-        if !viewModel.favoriteArtists.isEmpty {
-            Section("收藏 UP 主") {
-                ForEach(viewModel.favoriteArtists) { artist in
-                    NavigationLink {
-                        ArtistDetailScreen(viewModel: viewModel, artist: artist)
-                    } label: {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(artist.name)
-                                .font(.body)
-                            Text("UID \(artist.id)")
-                                .font(.footnote)
-                                .foregroundStyle(.secondary)
-                        }
+        switch selectedSection {
+        case .playlists:
+            Section("播放列表") {
+                NavigationLink {
+                    FavoritePlaylistDetailScreen(viewModel: viewModel)
+                } label: {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("我的收藏")
+                            .font(.body)
+                        Text("\(viewModel.favorites.count) 首")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
                     }
                 }
-                .onDelete { offsets in
-                    viewModel.removeFavoriteArtists(at: offsets)
-                }
-            }
-        }
 
-        Section("播放列表") {
-            NavigationLink {
-                FavoritePlaylistDetailScreen(viewModel: viewModel)
-            } label: {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("我的收藏")
-                        .font(.body)
-                    Text("\(viewModel.favorites.count) 首")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                }
-            }
-
-            if !viewModel.playlists.isEmpty {
-                ForEach(viewModel.playlists) { playlist in
-                    NavigationLink {
-                        PlaylistDetailScreen(viewModel: viewModel, playlistID: playlist.id)
-                    } label: {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(playlist.name)
-                                .font(.body)
-                            Text("\(playlist.items.count) 首")
-                                .font(.footnote)
-                                .foregroundStyle(.secondary)
+                if !viewModel.playlists.isEmpty {
+                    ForEach(viewModel.playlists) { playlist in
+                        NavigationLink {
+                            PlaylistDetailScreen(viewModel: viewModel, playlistID: playlist.id)
+                        } label: {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(playlist.name)
+                                    .font(.body)
+                                Text("\(playlist.items.count) 首")
+                                    .font(.footnote)
+                                    .foregroundStyle(.secondary)
+                            }
                         }
                     }
+                    .onDelete { offsets in
+                        viewModel.deletePlaylists(at: offsets)
+                    }
                 }
-                .onDelete { offsets in
-                    viewModel.deletePlaylists(at: offsets)
+
+                Button {
+                    newPlaylistName = ""
+                    showNewPlaylist = true
+                } label: {
+                    Label("新建播放列表", systemImage: "plus")
                 }
             }
-        }
 
-        if !viewModel.recentlyPlayed.isEmpty {
-            Section("最近播放") {
-                ForEach(viewModel.recentlyPlayed) { item in
-                    MusicRow(viewModel: viewModel, item: item, queueContext: viewModel.recentlyPlayed)
+            if !viewModel.recentlyPlayed.isEmpty {
+                Section("最近播放") {
+                    ForEach(viewModel.recentlyPlayed) { item in
+                        MusicRow(viewModel: viewModel, item: item, queueContext: viewModel.recentlyPlayed)
+                    }
+                    .onDelete { offsets in
+                        viewModel.removeRecentlyPlayed(at: offsets)
+                    }
                 }
-                .onDelete { offsets in
-                    viewModel.removeRecentlyPlayed(at: offsets)
+            }
+        case .following:
+            if viewModel.favoriteArtists.isEmpty {
+                ContentUnavailableView("还没有关注 UP 主", systemImage: "person.crop.circle.badge.plus", description: Text("在正在播放页点歌手名称进入主页后，可以收藏到这里。"))
+            } else {
+                Section("我的关注") {
+                    ForEach(viewModel.favoriteArtists) { artist in
+                        NavigationLink {
+                            ArtistDetailScreen(viewModel: viewModel, artist: artist)
+                        } label: {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text(artist.name)
+                                    .font(.body)
+                                Text("UID \(artist.id)")
+                                    .font(.footnote)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                    .onDelete { offsets in
+                        viewModel.removeFavoriteArtists(at: offsets)
+                    }
                 }
             }
         }
@@ -688,6 +796,7 @@ private struct ArtistDetailScreen: View {
     @ObservedObject var viewModel: BMusicViewModel
     let artist: BMusicArtist
     @State private var filterText = ""
+    @State private var resultSort: BMusicResultSort = .latest
 
     private var normalizedFilter: String {
         filterText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -695,14 +804,6 @@ private struct ArtistDetailScreen: View {
 
     var body: some View {
         List {
-            if viewModel.loadingArtistID == artist.id {
-                HStack {
-                    Spacer()
-                    ProgressView()
-                    Spacer()
-                }
-            }
-
             if let message = viewModel.artistErrorMessages[artist.id] {
                 Label(message, systemImage: "exclamationmark.triangle")
                     .foregroundStyle(.red)
@@ -729,6 +830,15 @@ private struct ArtistDetailScreen: View {
                     }
                 }
 
+                Picker("排序", selection: $resultSort) {
+                    Text(BMusicResultSort.latest.title).tag(BMusicResultSort.latest)
+                    Text(BMusicResultSort.mostPlayed.title).tag(BMusicResultSort.mostPlayed)
+                }
+                .pickerStyle(.segmented)
+                .onChange(of: resultSort) { _, newValue in
+                    Task { await viewModel.loadArtistVideos(artist, force: true, sort: newValue) }
+                }
+
                 Button {
                     Task { await viewModel.playAllArtistVideos(filteredVideos) }
                 } label: {
@@ -743,7 +853,7 @@ private struct ArtistDetailScreen: View {
                         MusicRow(viewModel: viewModel, item: item, queueContext: filteredVideos)
                             .task {
                                 if normalizedFilter.isEmpty {
-                                    await viewModel.loadMoreArtistVideosIfNeeded(artist, current: item)
+                                    await viewModel.loadMoreArtistVideosIfNeeded(artist, current: item, sort: resultSort)
                                 }
                             }
                     }
@@ -761,10 +871,10 @@ private struct ArtistDetailScreen: View {
         .listStyle(.insetGrouped)
         .navigationTitle(artist.name)
         .refreshable {
-            await viewModel.loadArtistVideos(artist, force: true)
+            await viewModel.loadArtistVideos(artist, force: true, sort: resultSort)
         }
         .task {
-            await viewModel.loadArtistVideos(artist)
+            await viewModel.loadArtistVideos(artist, sort: resultSort)
         }
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
@@ -854,6 +964,9 @@ private struct PlaylistDetailScreen: View {
                 viewModel.renamePlaylist(playlistID, to: renamedPlaylistName)
             }
         }
+        .enableInteractivePopGesture {
+            detailEditMode = .inactive
+        }
     }
 }
 
@@ -909,6 +1022,75 @@ private struct FavoritePlaylistDetailScreen: View {
         }
         .onAppear {
             visibleItems = viewModel.favorites
+        }
+        .enableInteractivePopGesture {
+            detailEditMode = .inactive
+        }
+    }
+}
+
+private extension View {
+    func enableInteractivePopGesture(onBegin: @escaping () -> Void = {}) -> some View {
+        background(InteractivePopGestureEnabler(onBegin: onBegin).frame(width: 0, height: 0))
+    }
+}
+
+private struct InteractivePopGestureEnabler: UIViewControllerRepresentable {
+    let onBegin: () -> Void
+
+    func makeUIViewController(context: Context) -> UIViewController {
+        let controller = UIViewController()
+        DispatchQueue.main.async {
+            context.coordinator.attach(to: controller.navigationController)
+        }
+        return controller
+    }
+
+    func updateUIViewController(_ uiViewController: UIViewController, context: Context) {
+        DispatchQueue.main.async {
+            context.coordinator.attach(to: uiViewController.navigationController)
+        }
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onBegin: onBegin)
+    }
+
+    final class Coordinator: NSObject, UIGestureRecognizerDelegate {
+        private let onBegin: () -> Void
+        private weak var navigationController: UINavigationController?
+        private weak var originalDelegate: UIGestureRecognizerDelegate?
+
+        init(onBegin: @escaping () -> Void) {
+            self.onBegin = onBegin
+        }
+
+        func attach(to navigationController: UINavigationController?) {
+            guard let navigationController,
+                  self.navigationController !== navigationController
+            else {
+                return
+            }
+
+            self.navigationController = navigationController
+            originalDelegate = navigationController.interactivePopGestureRecognizer?.delegate
+            navigationController.interactivePopGestureRecognizer?.delegate = self
+            navigationController.interactivePopGestureRecognizer?.isEnabled = true
+        }
+
+        func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+            guard let navigationController,
+                  navigationController.viewControllers.count > 1
+            else {
+                return false
+            }
+
+            onBegin()
+            return originalDelegate?.gestureRecognizerShouldBegin?(gestureRecognizer) ?? true
+        }
+
+        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+            originalDelegate?.gestureRecognizer?(gestureRecognizer, shouldRecognizeSimultaneouslyWith: otherGestureRecognizer) ?? false
         }
     }
 }
@@ -1566,17 +1748,10 @@ private struct VideoRow: View {
 
     var body: some View {
         HStack(spacing: 9) {
-            AsyncImage(url: item.coverURL) { phase in
-                switch phase {
-                case .success(let image):
-                    image.resizable().scaledToFill()
-                case .failure:
-                    Image(systemName: "music.note")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                default:
-                    ProgressView()
-                }
+            CachedRemoteImage(url: item.coverURL) {
+                Image(systemName: "music.note")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
             }
             .frame(width: 54, height: 38)
             .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
@@ -1685,19 +1860,8 @@ private struct MiniPlayerArtwork: View {
     let item: BMusicVideo?
 
     var body: some View {
-        AsyncImage(url: item?.coverURL) { phase in
-            switch phase {
-            case .success(let image):
-                image.resizable().scaledToFill()
-            case .failure:
-                placeholder
-            default:
-                if item == nil {
-                    placeholder
-                } else {
-                    ProgressView()
-                }
-            }
+        CachedRemoteImage(url: item?.coverURL) {
+            placeholder
         }
         .frame(width: 40, height: 40)
         .background(.quaternary)
@@ -1712,6 +1876,73 @@ private struct MiniPlayerArtwork: View {
                 .font(.body)
                 .foregroundStyle(.secondary)
         }
+    }
+}
+
+private struct CachedRemoteImage<Placeholder: View>: View {
+    let url: URL?
+    @ViewBuilder var placeholder: Placeholder
+    @State private var image: UIImage?
+
+    var body: some View {
+        ZStack {
+            if let image {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+            } else {
+                placeholder
+            }
+        }
+        .task(id: url) {
+            await loadImage()
+        }
+        .onChange(of: url) { _, newURL in
+            image = newURL.flatMap { BMusicImageMemoryCache.shared.image(for: $0) }
+        }
+    }
+
+    private func loadImage() async {
+        guard let url else {
+            image = nil
+            return
+        }
+
+        if let cachedImage = BMusicImageMemoryCache.shared.image(for: url) {
+            image = cachedImage
+            return
+        }
+
+        do {
+            let (data, _) = try await URLSession.shared.data(from: url)
+            guard !Task.isCancelled, let loadedImage = UIImage(data: data) else {
+                return
+            }
+            BMusicImageMemoryCache.shared.insert(loadedImage, for: url)
+            image = loadedImage
+        } catch {
+            image = nil
+        }
+    }
+}
+
+private final class BMusicImageMemoryCache {
+    static let shared = BMusicImageMemoryCache()
+
+    private let cache = NSCache<NSURL, UIImage>()
+
+    private init() {
+        cache.countLimit = 500
+        cache.totalCostLimit = 80 * 1024 * 1024
+    }
+
+    func image(for url: URL) -> UIImage? {
+        cache.object(forKey: url as NSURL)
+    }
+
+    func insert(_ image: UIImage, for url: URL) {
+        let cost = Int(image.size.width * image.size.height * image.scale * image.scale * 4)
+        cache.setObject(image, forKey: url as NSURL, cost: cost)
     }
 }
 
@@ -2088,18 +2319,9 @@ private struct PlayerQueueRow: View {
 
     var body: some View {
         HStack(spacing: 9) {
-            AsyncImage(url: item.coverURL) { phase in
-                switch phase {
-                case .success(let image):
-                    image.resizable().scaledToFill()
-                case .failure:
-                    Image(systemName: "music.note")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                default:
-                    Rectangle()
-                        .fill(.quaternary)
-                }
+            CachedRemoteImage(url: item.coverURL) {
+                Rectangle()
+                    .fill(.quaternary)
             }
             .frame(width: 54, height: 38)
             .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
@@ -2148,19 +2370,8 @@ private struct PlayerArtwork: View {
     let size: CGFloat
 
     var body: some View {
-        AsyncImage(url: item?.coverURL) { phase in
-            switch phase {
-            case .success(let image):
-                image.resizable().scaledToFill()
-            case .failure:
-                placeholder
-            default:
-                if item == nil {
-                    placeholder
-                } else {
-                    ProgressView()
-                }
-            }
+        CachedRemoteImage(url: item?.coverURL) {
+            placeholder
         }
         .frame(width: max(220, size), height: max(220, size))
         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
@@ -2208,6 +2419,8 @@ final class BMusicPlaybackProgress: ObservableObject {
 @MainActor
 final class BMusicViewModel: ObservableObject {
     @Published var searchText = ""
+    @Published var searchSort: BMusicResultSort = .default
+    @Published var hasSearchContext = false
     @Published var results: [BMusicVideo] = []
     @Published var queue: [BMusicVideo] = []
     @Published var favorites: [BMusicVideo] = []
@@ -2270,6 +2483,7 @@ final class BMusicViewModel: ObservableObject {
     private var currentQueueIndex: Int?
     private var queueBaseline: [BMusicVideo] = []
     private var activeSearchQueueKeyword: String?
+    private var loadedSearchResults: [BMusicVideo] = []
     private var audioCacheTask: Task<Void, Never>?
     private var playbackRecoveryTask: Task<Void, Never>?
     private var nextAudioPrefetchTask: Task<Void, Never>?
@@ -2278,6 +2492,7 @@ final class BMusicViewModel: ObservableObject {
     private let artistVideoPageSize = 50
     private var artistVideoPages: [Int: Int] = [:]
     private var artistVideoHasMore: [Int: Bool] = [:]
+    private var artistVideoSorts: [Int: BMusicResultSort] = [:]
 
     var canPlayNext: Bool {
         guard !queue.isEmpty else { return false }
@@ -2365,9 +2580,11 @@ final class BMusicViewModel: ObservableObject {
         }
 
         if reset {
+            hasSearchContext = true
             page = 1
             hasMore = true
             results = []
+            loadedSearchResults = []
             activeSearchQueueKeyword = nil
         }
         guard hasMore, !isSearching else {
@@ -2384,17 +2601,19 @@ final class BMusicViewModel: ObservableObject {
                 return
             }
 
-            let response = try await apiClient.search(keyword: keyword, page: page, pageSize: 20)
+            let response = try await apiClient.search(keyword: keyword, page: page, pageSize: 20, order: searchSort)
             let items = BMusicVideo.videos(from: response)
             let newItems: [BMusicVideo]
             if reset {
-                results = items
+                loadedSearchResults = items
+                results = sortedSearchResults(loadedSearchResults)
                 newItems = items
             } else {
                 newItems = items.filter { newItem in
-                    !results.contains(where: { $0.id == newItem.id })
+                    !loadedSearchResults.contains(where: { $0.id == newItem.id })
                 }
-                results.append(contentsOf: newItems)
+                loadedSearchResults.append(contentsOf: newItems)
+                results = sortedSearchResults(loadedSearchResults)
             }
             appendLoadedSearchResultsToActiveQueue(newItems)
             hasMore = !items.isEmpty
@@ -2422,6 +2641,18 @@ final class BMusicViewModel: ObservableObject {
         activeSearchQueueKeyword = normalizedSearchKeyword()
         applyQueueContext(results, currentItem: item)
         await play(item)
+    }
+
+    func sortLoadedSearchResults() {
+        guard !results.isEmpty else {
+            return
+        }
+
+        results = sortedSearchResults(loadedSearchResults.isEmpty ? results : loadedSearchResults)
+        if activeSearchQueueKeyword == normalizedSearchKeyword(),
+           let currentItem {
+            applyQueueContext(results, currentItem: currentItem)
+        }
     }
 
     func refreshRecommendedKeywords(force: Bool = false) async {
@@ -2910,17 +3141,21 @@ final class BMusicViewModel: ObservableObject {
             artistErrorMessages[id] = nil
             artistVideoPages[id] = nil
             artistVideoHasMore[id] = nil
+            artistVideoSorts[id] = nil
             loadingMoreArtistIDs.remove(id)
         }
         saveLibrary()
     }
 
-    func loadArtistVideos(_ artist: BMusicArtist, force: Bool = false) async {
-        if !force, artistVideos[artist.id]?.isEmpty == false {
+    func loadArtistVideos(_ artist: BMusicArtist, force: Bool = false, sort: BMusicResultSort = .latest) async {
+        if !force,
+           artistVideoSorts[artist.id] == sort,
+           artistVideos[artist.id]?.isEmpty == false {
             return
         }
         artistVideoPages[artist.id] = nil
         artistVideoHasMore[artist.id] = nil
+        artistVideoSorts[artist.id] = sort
         loadingMoreArtistIDs.remove(artist.id)
         loadingArtistID = artist.id
         artistErrorMessages[artist.id] = nil
@@ -2931,10 +3166,11 @@ final class BMusicViewModel: ObservableObject {
         }
 
         do {
-            let response = try await apiClient.spaceVideos(mid: artist.id, page: 1, pageSize: artistVideoPageSize)
+            let response = try await apiClient.spaceVideos(mid: artist.id, page: 1, pageSize: artistVideoPageSize, order: sort)
             let videos = BMusicVideo.spaceVideos(from: response, artist: artist)
             artistVideos[artist.id] = videos
             artistVideoPages[artist.id] = 1
+            artistVideoSorts[artist.id] = sort
             artistVideoHasMore[artist.id] = videos.count == artistVideoPageSize
         } catch where error.isCancellation {
             return
@@ -2943,8 +3179,9 @@ final class BMusicViewModel: ObservableObject {
         }
     }
 
-    func loadMoreArtistVideosIfNeeded(_ artist: BMusicArtist, current item: BMusicVideo) async {
+    func loadMoreArtistVideosIfNeeded(_ artist: BMusicArtist, current item: BMusicVideo, sort: BMusicResultSort = .latest) async {
         guard item.id == artistVideos[artist.id]?.last?.id,
+              artistVideoSorts[artist.id] == sort,
               artistVideoHasMore[artist.id] != false,
               loadingArtistID != artist.id,
               !loadingMoreArtistIDs.contains(artist.id)
@@ -2957,7 +3194,7 @@ final class BMusicViewModel: ObservableObject {
         defer { loadingMoreArtistIDs.remove(artist.id) }
 
         do {
-            let response = try await apiClient.spaceVideos(mid: artist.id, page: nextPage, pageSize: artistVideoPageSize)
+            let response = try await apiClient.spaceVideos(mid: artist.id, page: nextPage, pageSize: artistVideoPageSize, order: sort)
             let videos = BMusicVideo.spaceVideos(from: response, artist: artist)
             let existing = artistVideos[artist.id] ?? []
             let newVideos = videos.filter { video in
@@ -3684,24 +3921,24 @@ final class BMusicViewModel: ObservableObject {
             return
         }
 
-        if queueBaseline.isEmpty {
-            queueBaseline = queue
+        if let currentItem {
+            applyQueueContext(results, currentItem: currentItem)
         }
+    }
 
-        let newItems = Self.deduplicatedVideos(items).filter { item in
-            !queueBaseline.contains { $0.id == item.id }
+    private func sortedSearchResults(_ items: [BMusicVideo]) -> [BMusicVideo] {
+        switch searchSort {
+        case .default:
+            return items
+        case .latest:
+            return items.stablySorted { lhs, rhs in
+                (lhs.publishedAt ?? 0) > (rhs.publishedAt ?? 0)
+            }
+        case .mostPlayed:
+            return items.stablySorted { lhs, rhs in
+                (lhs.playCount ?? 0) > (rhs.playCount ?? 0)
+            }
         }
-        guard !newItems.isEmpty else {
-            return
-        }
-
-        queueBaseline.append(contentsOf: newItems)
-        if playbackMode == .shuffle {
-            queue.append(contentsOf: newItems.shuffled())
-        } else {
-            queue.append(contentsOf: newItems)
-        }
-        saveLibrary()
     }
 
     private func normalizedSearchKeyword() -> String {
@@ -3794,6 +4031,7 @@ final class BMusicViewModel: ObservableObject {
         }
 
         results = [video]
+        loadedSearchResults = [video]
         hasMore = false
         page = 1
         activeSearchQueueKeyword = nil
@@ -3856,6 +4094,8 @@ struct BMusicVideo: Codable, Identifiable, Hashable {
     var authorID: Int?
     var cover: String
     var duration: String
+    var playCount: Int?
+    var publishedAt: Int?
 
     private init(
         id: String,
@@ -3865,7 +4105,9 @@ struct BMusicVideo: Codable, Identifiable, Hashable {
         author: String,
         authorID: Int?,
         cover: String,
-        duration: String
+        duration: String,
+        playCount: Int? = nil,
+        publishedAt: Int? = nil
     ) {
         self.id = id
         self.bvid = bvid
@@ -3875,6 +4117,8 @@ struct BMusicVideo: Codable, Identifiable, Hashable {
         self.authorID = authorID
         self.cover = cover
         self.duration = duration
+        self.playCount = playCount
+        self.publishedAt = publishedAt
     }
 
     var coverURL: URL? {
@@ -3909,7 +4153,9 @@ struct BMusicVideo: Codable, Identifiable, Hashable {
             author: "",
             authorID: nil,
             cover: "",
-            duration: ""
+            duration: "",
+            playCount: nil,
+            publishedAt: nil
         )
     }
 
@@ -4009,6 +4255,12 @@ struct BMusicVideo: Codable, Identifiable, Hashable {
         self.author = searchResult["author"] as? String ?? searchResult["typename"] as? String ?? ""
         self.authorID = searchResult.intValue(for: "mid") ?? searchResult.intValue(for: "upic_mid")
         self.cover = searchResult["pic"] as? String ?? ""
+        self.playCount = searchResult.intValue(for: "play")
+            ?? searchResult.intValue(for: "click")
+            ?? searchResult.intValue(for: "view")
+        self.publishedAt = searchResult.intValue(for: "pubdate")
+            ?? searchResult.intValue(for: "senddate")
+            ?? searchResult.intValue(for: "created")
 
         if let duration = searchResult["duration"] as? String {
             self.duration = duration
@@ -4030,6 +4282,12 @@ struct BMusicVideo: Codable, Identifiable, Hashable {
         self.author = artist.name
         self.authorID = artist.id
         self.cover = spaceVideo["pic"] as? String ?? ""
+        self.playCount = spaceVideo.intValue(for: "play")
+            ?? spaceVideo.intValue(for: "click")
+            ?? spaceVideo.intValue(for: "view")
+        self.publishedAt = spaceVideo.intValue(for: "created")
+            ?? spaceVideo.intValue(for: "pubdate")
+            ?? spaceVideo.intValue(for: "senddate")
 
         if let duration = spaceVideo["length"] as? String {
             self.duration = duration
@@ -4066,6 +4324,12 @@ struct BMusicVideo: Codable, Identifiable, Hashable {
         self.cover = musicToplistItem["mv_cover"] as? String
             ?? musicToplistItem["creation_cover"] as? String
             ?? ""
+        self.playCount = musicToplistItem.intValue(for: "creation_play")
+            ?? musicToplistItem.intValue(for: "play")
+            ?? musicToplistItem.intValue(for: "view")
+        self.publishedAt = musicToplistItem.intValue(for: "creation_pubdate")
+            ?? musicToplistItem.intValue(for: "pubdate")
+            ?? musicToplistItem.intValue(for: "created")
 
         if let duration = musicToplistItem.intValue(for: "creation_duration") {
             self.duration = Double(duration).durationText
@@ -4115,6 +4379,22 @@ struct BMusicMusicToplistPeriod {
             .filter { $0.publishDate.timeIntervalSince1970 <= now + 24 * 60 * 60 }
             .max { $0.publishDate < $1.publishDate }
             ?? periods.max { $0.publishDate < $1.publishDate }
+    }
+}
+
+private extension Array {
+    func stablySorted(_ areInIncreasingOrder: (Element, Element) -> Bool) -> [Element] {
+        enumerated()
+            .sorted { lhs, rhs in
+                if areInIncreasingOrder(lhs.element, rhs.element) {
+                    return true
+                }
+                if areInIncreasingOrder(rhs.element, lhs.element) {
+                    return false
+                }
+                return lhs.offset < rhs.offset
+            }
+            .map(\.element)
     }
 }
 
