@@ -3,6 +3,119 @@ import Foundation
 import MediaPlayer
 import UIKit
 
+enum BMusicEqualizerPreset: String, CaseIterable, Identifiable, Codable {
+    case off
+    case acoustic
+    case bassBooster
+    case bassReducer
+    case classical
+    case dance
+    case deep
+    case electronic
+    case flat
+    case hipHop
+    case jazz
+    case latin
+    case loudness
+    case airPods
+    case carAudio
+    case carClear
+    case piano
+    case pop
+    case rhythmAndBlues
+    case rock
+    case smallSpeakers
+    case spokenWord
+    case trebleBooster
+    case trebleReducer
+    case vocalBooster
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .off: return "关闭"
+        case .acoustic: return "Acoustic"
+        case .bassBooster: return "Bass Booster"
+        case .bassReducer: return "Bass Reducer"
+        case .classical: return "Classical"
+        case .dance: return "Dance"
+        case .deep: return "Deep"
+        case .electronic: return "Electronic"
+        case .flat: return "Flat"
+        case .hipHop: return "Hip-Hop"
+        case .jazz: return "Jazz"
+        case .latin: return "Latin"
+        case .loudness: return "Loudness"
+        case .airPods: return "AirPods"
+        case .carAudio: return "车载音响"
+        case .carClear: return "车载清晰"
+        case .piano: return "Piano"
+        case .pop: return "Pop"
+        case .rhythmAndBlues: return "R&B"
+        case .rock: return "Rock"
+        case .smallSpeakers: return "Small Speakers"
+        case .spokenWord: return "Spoken Word"
+        case .trebleBooster: return "Treble Booster"
+        case .trebleReducer: return "Treble Reducer"
+        case .vocalBooster: return "Vocal Booster"
+        }
+    }
+
+    var bandGains: [Float] {
+        switch self {
+        case .off, .flat:
+            return [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        case .acoustic:
+            return [4, 3, 2, 1, 1, 2, 3, 4, 4, 3]
+        case .bassBooster:
+            return [6, 5, 4, 2, 0, 0, 0, 0, 0, 0]
+        case .bassReducer:
+            return [-6, -5, -4, -2, 0, 0, 0, 0, 0, 0]
+        case .classical:
+            return [4, 3, 2, 0, 0, 0, 1, 2, 3, 4]
+        case .dance:
+            return [5, 4, 2, 0, 0, -1, -1, 2, 4, 5]
+        case .deep:
+            return [5, 4, 3, 1, -1, -2, -1, 1, 3, 4]
+        case .electronic:
+            return [4, 3, 1, 0, -1, 1, 2, 3, 4, 4]
+        case .hipHop:
+            return [5, 4, 2, 1, -1, -1, 1, 2, 3, 4]
+        case .jazz:
+            return [3, 2, 1, 1, -1, -1, 0, 1, 2, 3]
+        case .latin:
+            return [4, 3, 1, 0, -1, -1, 0, 2, 3, 4]
+        case .loudness:
+            return [6, 5, 3, 1, 0, 0, 1, 3, 5, 6]
+        case .airPods:
+            return [2, 2, 1, 0, 1, 1, 1, 0, -1, -1]
+        case .carAudio:
+            return [-2, -1, 1, 1, 0, 1, 2, 2, 1, 0]
+        case .carClear:
+            return [-3, -1, 2, 1, 1, 2, 3, 2, 1, 0]
+        case .piano:
+            return [2, 1, 0, 1, 2, 2, 1, 0, 1, 2]
+        case .pop:
+            return [-1, 2, 4, 4, 2, 0, -1, -1, -1, -1]
+        case .rhythmAndBlues:
+            return [4, 3, 2, 1, -1, -1, 1, 2, 3, 4]
+        case .rock:
+            return [5, 4, 3, 1, -1, -1, 1, 3, 4, 5]
+        case .smallSpeakers:
+            return [-2, -1, 0, 2, 3, 3, 2, 1, 0, -1]
+        case .spokenWord:
+            return [-3, -2, -1, 2, 4, 4, 3, 1, -1, -2]
+        case .trebleBooster:
+            return [0, 0, 0, 0, 0, 1, 2, 4, 5, 6]
+        case .trebleReducer:
+            return [0, 0, 0, 0, 0, -1, -2, -4, -5, -6]
+        case .vocalBooster:
+            return [-2, -1, 0, 2, 4, 4, 3, 1, 0, -1]
+        }
+    }
+}
+
 enum NativeAudioError: LocalizedError {
     case invalidURL
     case downloadFailed(String)
@@ -29,8 +142,10 @@ final class NativeAudioPlayer {
     private var currentArtwork: MPMediaItemArtwork?
     private var artworkTask: Task<Void, Never>?
     private var temporaryAudioURL: URL?
+    private var equalizedTemporaryAudioURL: URL?
     private var playbackRequestID = UUID()
     private var volumeBalancingEnabled = true
+    private var equalizerPreset: BMusicEqualizerPreset = .off
     private var balancedVolumes: [String: Float] = [:]
     private static let managedTemporaryAudioPrefix = "eno-audio-"
     private static let systemDownloadTemporaryPrefix = "CFNetworkDownload"
@@ -46,6 +161,10 @@ final class NativeAudioPlayer {
     func setVolumeBalancingEnabled(_ enabled: Bool) {
         volumeBalancingEnabled = enabled
         player?.volume = enabled ? (player?.volume ?? 1) : 1
+    }
+
+    func setEqualizerPreset(_ preset: BMusicEqualizerPreset) {
+        equalizerPreset = preset
     }
 
     func playCached(cacheID: String, title: String?, artist: String?, artworkURL: String?) async throws -> Bool {
@@ -74,7 +193,11 @@ final class NativeAudioPlayer {
             throw CancellationError()
         }
 
-        let item = AVPlayerItem(url: localURL)
+        let playbackURL = await equalizedPlaybackURL(for: localURL, preset: equalizerPreset, requestID: requestID) ?? localURL
+        guard isCurrentPlaybackRequest(requestID) else {
+            throw CancellationError()
+        }
+        let item = AVPlayerItem(url: playbackURL)
         let player = AVPlayer(playerItem: item)
         let volume = await playbackVolume(for: localURL, requestID: requestID)
         guard isCurrentPlaybackRequest(requestID) else {
@@ -139,7 +262,11 @@ final class NativeAudioPlayer {
             throw CancellationError()
         }
 
-        let item = AVPlayerItem(url: localURL)
+        let playbackURL = await equalizedPlaybackURL(for: localURL, preset: equalizerPreset, requestID: requestID) ?? localURL
+        guard isCurrentPlaybackRequest(requestID) else {
+            throw CancellationError()
+        }
+        let item = AVPlayerItem(url: playbackURL)
         let player = AVPlayer(playerItem: item)
         let volume = await playbackVolume(for: localURL, requestID: requestID)
         guard isCurrentPlaybackRequest(requestID) else {
@@ -309,6 +436,103 @@ final class NativeAudioPlayer {
         return Float(min(1, max(0.72, gain)))
     }
 
+    private func equalizedPlaybackURL(for url: URL, preset: BMusicEqualizerPreset, requestID: UUID) async -> URL? {
+        guard preset != .off, preset != .flat else {
+            return nil
+        }
+
+        sendState("loading", message: "正在应用均衡器...")
+        let outputURL = await Task.detached(priority: .userInitiated) {
+            Self.renderEqualizedAudio(from: url, preset: preset)
+        }.value
+
+        guard isCurrentPlaybackRequest(requestID) else {
+            if let outputURL {
+                try? FileManager.default.removeItem(at: outputURL)
+            }
+            return nil
+        }
+
+        equalizedTemporaryAudioURL = outputURL
+        return outputURL
+    }
+
+    private static func renderEqualizedAudio(from inputURL: URL, preset: BMusicEqualizerPreset) -> URL? {
+        do {
+            let inputFile = try AVAudioFile(forReading: inputURL)
+            let processingFormat = inputFile.processingFormat
+            guard inputFile.length > 0 else {
+                return nil
+            }
+
+            let engine = AVAudioEngine()
+            let player = AVAudioPlayerNode()
+            let eq = AVAudioUnitEQ(numberOfBands: preset.bandGains.count)
+            let frequencies: [Float] = [32, 64, 125, 250, 500, 1_000, 2_000, 4_000, 8_000, 16_000]
+
+            for (index, gain) in preset.bandGains.enumerated() {
+                let band = eq.bands[index]
+                band.filterType = .parametric
+                band.frequency = frequencies[index]
+                band.bandwidth = 0.5
+                band.gain = gain
+                band.bypass = false
+            }
+
+            engine.attach(player)
+            engine.attach(eq)
+            engine.connect(player, to: eq, format: processingFormat)
+            engine.connect(eq, to: engine.mainMixerNode, format: processingFormat)
+
+            let maximumFrameCount: AVAudioFrameCount = 4096
+            try engine.enableManualRenderingMode(.offline, format: processingFormat, maximumFrameCount: maximumFrameCount)
+            try engine.start()
+
+            player.scheduleFile(inputFile, at: nil)
+            player.play()
+
+            let outputURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent("eno-audio-eq-\(UUID().uuidString)")
+                .appendingPathExtension("caf")
+            let outputFile = try AVAudioFile(forWriting: outputURL, settings: engine.manualRenderingFormat.settings)
+            guard let buffer = AVAudioPCMBuffer(
+                pcmFormat: engine.manualRenderingFormat,
+                frameCapacity: engine.manualRenderingMaximumFrameCount
+            ) else {
+                engine.stop()
+                return nil
+            }
+
+            while engine.manualRenderingSampleTime < inputFile.length {
+                let remainingFrames = inputFile.length - engine.manualRenderingSampleTime
+                let framesToRender = AVAudioFrameCount(min(Int64(engine.manualRenderingMaximumFrameCount), remainingFrames))
+
+                switch try engine.renderOffline(framesToRender, to: buffer) {
+                case .success:
+                    try outputFile.write(from: buffer)
+                case .insufficientDataFromInputNode:
+                    continue
+                case .cannotDoInCurrentContext:
+                    continue
+                case .error:
+                    engine.stop()
+                    try? FileManager.default.removeItem(at: outputURL)
+                    return nil
+                @unknown default:
+                    engine.stop()
+                    try? FileManager.default.removeItem(at: outputURL)
+                    return nil
+                }
+            }
+
+            player.stop()
+            engine.stop()
+            return outputURL
+        } catch {
+            return nil
+        }
+    }
+
     private func observe(item: AVPlayerItem, player: AVPlayer) {
         statusObserver = item.observe(\.status, options: [.new]) { [weak self] item, _ in
             DispatchQueue.main.async {
@@ -471,6 +695,11 @@ final class NativeAudioPlayer {
     }
 
     private func removeTemporaryAudio() {
+        if let equalizedTemporaryAudioURL {
+            try? FileManager.default.removeItem(at: equalizedTemporaryAudioURL)
+            self.equalizedTemporaryAudioURL = nil
+        }
+
         guard let temporaryAudioURL else {
             Self.removeStaleTemporaryAudio()
             return

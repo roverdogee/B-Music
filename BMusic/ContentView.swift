@@ -1261,10 +1261,18 @@ private struct SettingsScreen: View {
                     .onChange(of: viewModel.balancesVolume) { _, enabled in
                         viewModel.setBalancesVolume(enabled)
                     }
+                Picker("均衡器", selection: $viewModel.equalizerPreset) {
+                    ForEach(BMusicEqualizerPreset.allCases) { preset in
+                        Text(preset.title).tag(preset)
+                    }
+                }
+                .onChange(of: viewModel.equalizerPreset) { _, preset in
+                    viewModel.setEqualizerPreset(preset)
+                }
             } header: {
                 Text("播放")
             } footer: {
-                Text("分析本地音频的平均响度并自动调整播放增益，减小连续切歌时忽大忽小的差异。")
+                Text("音量平衡会分析本地音频响度并自动调整播放增益。均衡器预设会在下一首开始播放时生效。")
             }
 
             Section("资料库") {
@@ -2451,6 +2459,7 @@ final class BMusicViewModel: ObservableObject {
     @Published var showQueueInPlayer = true
     @Published var playbackMode: BMusicPlaybackMode = .listLoop
     @Published var balancesVolume = true
+    @Published var equalizerPreset: BMusicEqualizerPreset = .off
     @Published var showPlaylistPicker = false
     @Published var playlistPickerItem: BMusicVideo?
     @Published var cachesRecentPlays = true
@@ -2972,8 +2981,14 @@ final class BMusicViewModel: ObservableObject {
 
     func setBalancesVolume(_ enabled: Bool) {
         balancesVolume = enabled
-        playbackPreferencesStore.save(BMusicPlaybackPreferences(balancesVolume: enabled))
+        savePlaybackPreferences()
         audioPlayer.setVolumeBalancingEnabled(enabled)
+    }
+
+    func setEqualizerPreset(_ preset: BMusicEqualizerPreset) {
+        equalizerPreset = preset
+        savePlaybackPreferences()
+        audioPlayer.setEqualizerPreset(preset)
     }
 
     func setCachesFavorites(_ enabled: Bool) {
@@ -3757,7 +3772,16 @@ final class BMusicViewModel: ObservableObject {
     private func restorePlaybackPreferences() {
         let preferences = playbackPreferencesStore.load()
         balancesVolume = preferences.balancesVolume
+        equalizerPreset = preferences.equalizerPreset
         audioPlayer.setVolumeBalancingEnabled(preferences.balancesVolume)
+        audioPlayer.setEqualizerPreset(preferences.equalizerPreset)
+    }
+
+    private func savePlaybackPreferences() {
+        playbackPreferencesStore.save(BMusicPlaybackPreferences(
+            balancesVolume: balancesVolume,
+            equalizerPreset: equalizerPreset
+        ))
     }
 
     private func saveLibrary() {
@@ -4795,6 +4819,23 @@ struct BMusicCachePreferences: Codable {
 
 struct BMusicPlaybackPreferences: Codable {
     var balancesVolume = true
+    var equalizerPreset: BMusicEqualizerPreset = .off
+
+    enum CodingKeys: String, CodingKey {
+        case balancesVolume
+        case equalizerPreset
+    }
+
+    init(balancesVolume: Bool = true, equalizerPreset: BMusicEqualizerPreset = .off) {
+        self.balancesVolume = balancesVolume
+        self.equalizerPreset = equalizerPreset
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        balancesVolume = try container.decodeIfPresent(Bool.self, forKey: .balancesVolume) ?? true
+        equalizerPreset = try container.decodeIfPresent(BMusicEqualizerPreset.self, forKey: .equalizerPreset) ?? .off
+    }
 }
 
 final class BMusicPlaybackPreferencesStore {
