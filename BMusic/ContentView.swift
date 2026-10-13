@@ -1137,9 +1137,13 @@ private struct VideoPartsScreen: View {
                                 .font(.caption.monospacedDigit())
                                 .foregroundStyle(.secondary)
                                 .frame(width: 32)
+                            Image(systemName: "speaker.wave.2.fill")
+                                .font(.caption)
+                                .frame(width: 16)
+                                .opacity(viewModel.isCurrentVideoPart(item) ? 1 : 0)
                             VideoRow(
                                 item: item,
-                                isCurrent: viewModel.currentItem?.id == item.id,
+                                isCurrent: viewModel.isCurrentVideoPart(item),
                                 favoriteSystemImage: viewModel.isFavorite(item) ? "heart.fill" : "heart"
                             ) {
                                 Task { await viewModel.playSelectedPart(item) }
@@ -1372,7 +1376,7 @@ private struct SettingsScreen: View {
             } header: {
                 Text("播放")
             } footer: {
-                Text("音量平衡会分析本地音频响度并自动调整播放增益。均衡器预设会在下一首开始播放时生效。")
+                Text("音量平衡会分析本地音频响度并自动调整播放增益。均衡器预设切换后即时生效。")
             }
 
             Section("资料库") {
@@ -2095,6 +2099,8 @@ private struct PlayerScreen: View {
                                 artworkSize: min(proxy.size.width - 64, proxy.size.height * 0.35)
                             )
 
+                            PlayerVideoPartsRow(viewModel: viewModel)
+
                             if viewModel.showQueueInPlayer {
                                 PlayerQueueList(viewModel: viewModel)
                             }
@@ -2121,6 +2127,9 @@ private struct PlayerScreen: View {
                         .font(.footnote.weight(.semibold))
                         .foregroundStyle(.secondary)
                 }
+            }
+            .task(id: viewModel.currentItem?.bvid) {
+                await viewModel.loadCurrentVideoParts()
             }
         }
     }
@@ -2191,6 +2200,61 @@ private struct PlayerDynamicBackground: View {
                 withAnimation(.easeInOut(duration: 1.25)) {
                     palette = .default
                 }
+            }
+        }
+    }
+}
+
+private struct PlayerVideoPartsRow: View {
+    @ObservedObject var viewModel: BMusicViewModel
+    @State private var isOpening = false
+    @State private var errorMessage: String?
+
+    var body: some View {
+        if let item = viewModel.currentItem,
+           viewModel.currentVideoParts.count > 1 || item.partNumber != nil {
+            VStack(spacing: 0) {
+                Button {
+                    isOpening = true
+                    Task {
+                        errorMessage = await viewModel.openCurrentVideoParts()
+                        isOpening = false
+                    }
+                } label: {
+                    HStack(spacing: 12) {
+                        Image(systemName: "rectangle.stack")
+                            .font(.title3)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("视频选集")
+                                .font(.subheadline.weight(.semibold))
+                            Text(item.videoTitle ?? viewModel.currentVideoParts.first?.videoTitle ?? item.title)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                        Spacer(minLength: 8)
+                        Text(viewModel.currentVideoPartLabel)
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                        Image(systemName: "chevron.right")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                    }
+                    .foregroundStyle(.primary)
+                    .padding(.vertical, 10)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(isOpening)
+                Divider().opacity(0.22)
+            }
+            .alert("选集加载失败", isPresented: Binding(
+                get: { errorMessage != nil },
+                set: { if !$0 { errorMessage = nil } }
+            )) {
+                Button("确定", role: .cancel) { errorMessage = nil }
+            } message: {
+                Text(errorMessage ?? "")
             }
         }
     }
@@ -2590,6 +2654,7 @@ final class BMusicViewModel: ObservableObject {
     @Published var playlistPickerItems: [BMusicVideo] = []
     @Published var showVideoParts = false
     @Published var selectedVideoParts: [BMusicVideo] = []
+    @Published private(set) var loadedCurrentVideoParts: [BMusicVideo] = []
     @Published var selectsPartForNextPlayback = false
     @Published var cachesRecentPlays = true
     @Published var cachesFavorites = false
@@ -2621,6 +2686,7 @@ final class BMusicViewModel: ObservableObject {
     private var videoSelectionRequestID = UUID()
     private var videoPartsCache: [String: [BMusicVideo]] = [:]
     private var videoDetailsCache: [String: BMusicVideo] = [:]
+    private var videoPartsTasks: [String: Task<[BMusicVideo], Error>] = [:]
     private var currentQueueIndex: Int?
     private var queueBaseline: [BMusicVideo] = []
     private var activeSearchQueueKeyword: String?
@@ -2684,6 +2750,79 @@ final class BMusicViewModel: ObservableObject {
     var appVersionText: String {
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
         return version.flatMap { $0.isEmpty ? nil : $0 } ?? "未知"
+    }
+
+    var currentVideoParts: [BMusicVideo] {
+        guard loadedCurrentVideoParts.first?.bvid == currentItem?.bvid else { return [] }
+        return loadedCurrentVideoParts
+    }
+
+    var currentVideoPartLabel: String {
+        let part = currentVideoParts.first { isCurrentVideoPart($0) }
+        let number = part?.partNumber ?? currentItem?.partNumber ?? 1
+        let count = currentVideoParts.count
+        return count > 1 ? "P\(number) / 共 \(count) P" : "P\(number)"
+    }
+
+    func isCurrentVideoPart(_ part: BMusicVideo) -> Bool {
+        guard let current = currentItem, current.bvid == part.bvid else { return false }
+        if let cid = current.cid { return cid == part.cid }
+        return (current.partNumber ?? 1) == part.partNumber
+    }
+
+    func loadCurrentVideoParts() async {
+        guard let item = currentItem else {
+            loadedCurrentVideoParts = []
+            return
+        }
+        do {
+            let parts = try await fetchVideoParts(for: item)
+            guard !Task.isCancelled, currentItem?.bvid == item.bvid else { return }
+            loadedCurrentVideoParts = parts
+        } catch { return }
+    }
+
+    func openCurrentVideoParts() async -> String? {
+        guard let item = currentItem else { return nil }
+        let requestID = UUID()
+        videoSelectionRequestID = requestID
+        do {
+            let parts = try await fetchVideoParts(for: item)
+            guard !Task.isCancelled, videoSelectionRequestID == requestID,
+                  currentItem?.bvid == item.bvid else { return nil }
+            guard parts.count > 1 else { return "这个视频目前没有其他分 P。" }
+            loadedCurrentVideoParts = parts
+            selectedVideoParts = parts
+            selectsPartForNextPlayback = false
+            showVideoParts = true
+            return nil
+        } catch {
+            return videoSelectionRequestID == requestID && currentItem?.bvid == item.bvid ? error.localizedDescription : nil
+        }
+    }
+
+    private func fetchVideoParts(for item: BMusicVideo) async throws -> [BMusicVideo] {
+        if let cached = videoPartsCache[item.bvid] { return cached }
+        if let pending = videoPartsTasks[item.bvid] { return try await pending.value }
+        let task = Task { [self] in
+            let response = try await apiClient.request(payload: [
+                "contentScriptQuery": "getVideoInfo", "bvid": item.bvid
+            ])
+            var parent = item
+            parent.id = item.bvid
+            parent.partNumber = nil
+            parent.videoTitle = nil
+            guard let detail = BMusicVideo.detail(from: response, fallback: parent) else {
+                throw BMusicError.invalidVideo
+            }
+            let parts = BMusicVideo.parts(from: response, fallback: detail)
+            videoDetailsCache[item.bvid] = detail
+            videoPartsCache[item.bvid] = parts
+            return parts
+        }
+        videoPartsTasks[item.bvid] = task
+        defer { videoPartsTasks[item.bvid] = nil }
+        return try await task.value
     }
 
     init() {
@@ -3438,21 +3577,8 @@ final class BMusicViewModel: ObservableObject {
         var selected = item
         if item.partNumber == nil {
             do {
-                let parts: [BMusicVideo]
-                if let cached = videoPartsCache[item.bvid] {
-                    parts = cached
-                } else {
-                    let response = try await apiClient.request(payload: [
-                        "contentScriptQuery": "getVideoInfo", "bvid": item.bvid
-                    ])
-                    parts = BMusicVideo.parts(from: response, fallback: item)
-                    guard videoSelectionRequestID == requestID else { return }
-                    guard let detail = BMusicVideo.detail(from: response, fallback: item) else {
-                        throw BMusicError.invalidVideo
-                    }
-                    videoDetailsCache[item.bvid] = detail
-                    videoPartsCache[item.bvid] = parts
-                }
+                let parts = try await fetchVideoParts(for: item)
+                guard videoSelectionRequestID == requestID else { return }
                 if parts.count > 1 {
                     selectedVideoParts = parts
                     selectsPartForNextPlayback = playNext
@@ -4361,7 +4487,7 @@ final class BMusicViewModel: ObservableObject {
                 schedulePlaybackRecovery(for: currentItem, requestID: playbackRequestID, message: "网络卡顿，10 秒后自动重连...")
             } else if state == "failed", let currentItem {
                 schedulePlaybackRecovery(for: currentItem, requestID: playbackRequestID, message: "播放失败，10 秒后自动重试...")
-            } else if state == "playing" || state == "ready" {
+            } else if state == "playing" || state == "ready" || state == "paused" || state == "stopped" {
                 cancelPlaybackRecovery()
             }
         case "native-audio-progress":
@@ -4496,10 +4622,13 @@ struct BMusicVideo: Codable, Identifiable, Hashable {
     }
 
     static func parts(from response: Any, fallback: BMusicVideo) -> [BMusicVideo] {
+        var parent = fallback
+        parent.partNumber = nil
+        parent.videoTitle = nil
         guard let root = response as? [String: Any],
               let data = root["data"] as? [String: Any],
               let pages = data["pages"] as? [[String: Any]],
-              let detail = detail(from: response, fallback: fallback)
+              let detail = detail(from: response, fallback: parent)
         else { return [] }
         return pages.enumerated().compactMap { index, page in
             guard let cid = page.intValue(for: "cid"), cid > 0 else { return nil }

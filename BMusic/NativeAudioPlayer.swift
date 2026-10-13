@@ -130,187 +130,155 @@ enum NativeAudioError: LocalizedError {
     }
 }
 
+@MainActor
 final class NativeAudioPlayer {
-    private var player: AVPlayer?
-    private var playerItem: AVPlayerItem?
-    private var statusObserver: NSKeyValueObservation?
-    private var timeControlObserver: NSKeyValueObservation?
-    private var endObserver: NSObjectProtocol?
-    private var periodicTimeObserver: Any?
+    private let core = BMusicAudioEngine()
     private var currentTitle = ""
     private var currentArtist = ""
     private var currentArtwork: MPMediaItemArtwork?
     private var artworkTask: Task<Void, Never>?
+    private var volumeTask: Task<Void, Never>?
+    private var recoveryTask: Task<Void, Never>?
     private var temporaryAudioURL: URL?
-    private var equalizedTemporaryAudioURL: URL?
+    private var currentAudioURL: URL?
     private var playbackRequestID = UUID()
     private var volumeBalancingEnabled = true
     private var equalizerPreset: BMusicEqualizerPreset = .off
     private var balancedVolumes: [String: Float] = [:]
-    private static let managedTemporaryAudioPrefix = "eno-audio-"
-    private static let systemDownloadTemporaryPrefix = "CFNetworkDownload"
-    private static let staleSystemDownloadAge: TimeInterval = 300
+    private var wantsPlayback = false
+    private var isInterrupted = false
+    private var resumeAfterInterruption = false
+    private var isRebuilding = false
+    private var needsEngineRecreation = false
+    private var needsGraphRecovery = false
+    private var progressTimer: Timer?
+    private var sessionObservers: [NSObjectProtocol] = []
+    private var remoteTargets: [(MPRemoteCommand, Any)] = []
+    private nonisolated static let managedTemporaryAudioPrefix = "eno-audio-"
+    private nonisolated static let systemDownloadTemporaryPrefix = "CFNetworkDownload"
+    private nonisolated static let staleSystemDownloadAge: TimeInterval = 300
     private let sendEvent: (String, [String: Any]) -> Void
 
     init(sendEvent: @escaping (String, [String: Any]) -> Void = { _, _ in }) {
         self.sendEvent = sendEvent
         Self.removeStaleTemporaryAudio()
+        core.onEnded = { [weak self] in
+            guard let self else { return }
+            self.wantsPlayback = false
+            self.stopProgressTimer()
+            self.sendProgress()
+            self.updateNowPlaying()
+            self.sendState("ended")
+        }
+        core.onFailure = { [weak self] error in
+            self?.sendState("failed", message: error.localizedDescription)
+        }
+        configureSessionObservers()
         configureRemoteCommands()
     }
 
     func setVolumeBalancingEnabled(_ enabled: Bool) {
         volumeBalancingEnabled = enabled
-        player?.volume = enabled ? (player?.volume ?? 1) : 1
+        volumeTask?.cancel()
+        guard enabled, let url = currentAudioURL else {
+            core.setVolume(1)
+            return
+        }
+        let requestID = playbackRequestID
+        volumeTask = Task { [weak self] in
+            guard let self else { return }
+            let volume = await self.playbackVolume(for: url, requestID: requestID)
+            guard !Task.isCancelled, self.isCurrentPlaybackRequest(requestID) else { return }
+            self.core.setVolume(volume)
+        }
     }
 
     func setEqualizerPreset(_ preset: BMusicEqualizerPreset) {
         equalizerPreset = preset
+        core.setEqualizer(gains: preset.bandGains)
     }
 
     func playCached(cacheID: String, title: String?, artist: String?, artworkURL: String?, startPosition: Double = 0, legacyCacheID: String? = nil) async throws -> Bool {
-        guard let localURL = await BMusicAudioCache.shared.cachedURL(for: cacheID, legacyID: legacyCacheID) else {
-            return false
-        }
-
-        let requestID = UUID()
-        playbackRequestID = requestID
-        artworkTask?.cancel()
-        artworkTask = nil
-        currentArtwork = nil
-        cleanupObservers()
-        player?.pause()
-        player = nil
-        playerItem = nil
-        removeTemporaryAudio()
-        currentTitle = title ?? ""
-        currentArtist = artist ?? ""
-        loadArtwork(from: artworkURL)
-        try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [])
-        try AVAudioSession.sharedInstance().setActive(true)
-
+        let requestID = beginPlayback(title: title, artist: artist, artworkURL: artworkURL)
+        let localURL = await BMusicAudioCache.shared.cachedURL(for: cacheID, legacyID: legacyCacheID)
+        try checkRequest(requestID)
+        guard let localURL else { return false }
         sendState("loading", message: "正在读取缓存...")
-        guard isCurrentPlaybackRequest(requestID) else {
-            throw CancellationError()
-        }
-
-        let playbackURL = await equalizedPlaybackURL(for: localURL, preset: equalizerPreset, requestID: requestID) ?? localURL
-        guard isCurrentPlaybackRequest(requestID) else {
-            throw CancellationError()
-        }
-        let item = AVPlayerItem(url: playbackURL)
-        let player = AVPlayer(playerItem: item)
-        let volume = await playbackVolume(for: localURL, requestID: requestID)
-        guard isCurrentPlaybackRequest(requestID) else {
-            throw CancellationError()
-        }
-        player.volume = volume
-        self.playerItem = item
-        self.player = player
-        try await restorePosition(startPosition, player: player, requestID: requestID)
-        observe(item: item, player: player)
-        updateNowPlaying(playbackRate: 1)
-        sendState("loading")
-        player.play()
-
+        try await prepareAudio(at: localURL, startPosition: startPosition, requestID: requestID)
         return true
     }
 
     func play(url: String, title: String?, artist: String?, artworkURL: String?, cookie: String = "", cacheID: String? = nil, startPosition: Double = 0) async throws -> Any {
-        guard let audioURL = URL(string: url) else {
-            throw NativeAudioError.invalidURL
-        }
-
-        let requestID = UUID()
-        playbackRequestID = requestID
-        artworkTask?.cancel()
-        artworkTask = nil
-        currentArtwork = nil
-        cleanupObservers()
-        player?.pause()
-        player = nil
-        playerItem = nil
-        removeTemporaryAudio()
-        currentTitle = title ?? ""
-        currentArtist = artist ?? ""
-        loadArtwork(from: artworkURL)
-        try AVAudioSession.sharedInstance().setCategory(.playback, mode: .default, options: [])
-        try AVAudioSession.sharedInstance().setActive(true)
-
+        guard let audioURL = URL(string: url) else { throw NativeAudioError.invalidURL }
+        let requestID = beginPlayback(title: title, artist: artist, artworkURL: artworkURL)
         sendState("loading", message: "正在准备音频...")
         let localURL: URL
         do {
             if let cacheID {
                 localURL = try await BMusicAudioCache.shared.audioURL(
-                    for: cacheID,
-                    sourceURL: audioURL,
-                    cookie: cookie,
+                    for: cacheID, sourceURL: audioURL, cookie: cookie,
                     cancelingActivePlaybackDownload: true
                 )
             } else {
                 localURL = try await downloadTemporaryAudio(from: audioURL, cookie: cookie)
-                temporaryAudioURL = localURL
             }
         } catch {
-            if !isCurrentPlaybackRequest(requestID) {
-                throw CancellationError()
-            }
+            try checkRequest(requestID)
             throw error
         }
         guard isCurrentPlaybackRequest(requestID) else {
-            if cacheID == nil {
-                try? FileManager.default.removeItem(at: localURL)
-            }
+            if cacheID == nil { try? FileManager.default.removeItem(at: localURL) }
             throw CancellationError()
         }
-
-        let playbackURL = await equalizedPlaybackURL(for: localURL, preset: equalizerPreset, requestID: requestID) ?? localURL
-        guard isCurrentPlaybackRequest(requestID) else {
-            throw CancellationError()
-        }
-        let item = AVPlayerItem(url: playbackURL)
-        let player = AVPlayer(playerItem: item)
-        let volume = await playbackVolume(for: localURL, requestID: requestID)
-        guard isCurrentPlaybackRequest(requestID) else {
-            throw CancellationError()
-        }
-        player.volume = volume
-        self.playerItem = item
-        self.player = player
-        try await restorePosition(startPosition, player: player, requestID: requestID)
-        observe(item: item, player: player)
-        updateNowPlaying(playbackRate: 1)
-        sendState("loading")
-        player.play()
-
-        return [
-            "success": true,
-            "title": title ?? "",
-            "artist": artist ?? ""
-        ]
+        if cacheID == nil { temporaryAudioURL = localURL }
+        try await prepareAudio(at: localURL, startPosition: startPosition, requestID: requestID)
+        return ["success": true, "title": title ?? "", "artist": artist ?? ""]
     }
 
     func pause() -> Any {
-        player?.pause()
-        updateNowPlaying(playbackRate: 0)
+        wantsPlayback = false
+        resumeAfterInterruption = false
+        recoveryTask?.cancel()
+        core.pause()
+        stopProgressTimer()
+        sendProgress()
+        updateNowPlaying()
         sendState("paused")
         return ["success": true]
     }
 
     func resume() -> Any {
-        player?.play()
-        updateNowPlaying(playbackRate: 1)
-        sendState("playing")
-        return ["success": true]
+        wantsPlayback = true
+        guard !isInterrupted, core.hasAudio else { return ["success": true] }
+        do {
+            recoveryTask?.cancel()
+            try activateSession()
+            if needsGraphRecovery || needsEngineRecreation {
+                try core.rebuild(recreateEngine: needsEngineRecreation, resume: false)
+                needsEngineRecreation = false
+                needsGraphRecovery = false
+            }
+            try core.play()
+            startProgressTimer()
+            updateNowPlaying()
+            sendState("playing")
+            return ["success": true]
+        } catch {
+            sendState("failed", message: error.localizedDescription)
+            return ["success": false]
+        }
     }
 
     func stop() -> Any {
         playbackRequestID = UUID()
-        player?.pause()
-        cleanupObservers()
-        player = nil
-        playerItem = nil
         artworkTask?.cancel()
-        artworkTask = nil
+        volumeTask?.cancel()
+        recoveryTask?.cancel()
+        wantsPlayback = false
+        resumeAfterInterruption = false
+        core.stop()
+        stopProgressTimer()
+        currentAudioURL = nil
         currentArtwork = nil
         removeTemporaryAudio()
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
@@ -319,36 +287,73 @@ final class NativeAudioPlayer {
     }
 
     func seek(seconds: Double) -> Any {
-        guard let player else {
+        guard core.hasAudio else { return ["success": false] }
+        do {
+            try core.seek(to: seconds)
+            sendProgress()
+            updateNowPlaying()
+            return ["success": true, "position": core.position]
+        } catch {
+            sendState("failed", message: error.localizedDescription)
             return ["success": false]
         }
+    }
 
-        let safeSeconds = max(0, seconds)
-        let time = CMTime(seconds: safeSeconds, preferredTimescale: 600)
-        player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
-            DispatchQueue.main.async {
-                self?.sendProgress()
-                self?.updateNowPlaying(playbackRate: player.rate)
-            }
+    private func beginPlayback(title: String?, artist: String?, artworkURL: String?) -> UUID {
+        playbackRequestID = UUID()
+        artworkTask?.cancel()
+        volumeTask?.cancel()
+        recoveryTask?.cancel()
+        core.stop()
+        stopProgressTimer()
+        removeTemporaryAudio()
+        currentAudioURL = nil
+        currentArtwork = nil
+        currentTitle = title ?? ""
+        currentArtist = artist ?? ""
+        wantsPlayback = true
+        resumeAfterInterruption = isInterrupted
+        loadArtwork(from: artworkURL)
+        updateNowPlaying()
+        return playbackRequestID
+    }
+
+    private func prepareAudio(at url: URL, startPosition: Double, requestID: UUID) async throws {
+        let volume = await playbackVolume(for: url, requestID: requestID)
+        try checkRequest(requestID)
+        if !isInterrupted { try activateSession() }
+        if needsEngineRecreation {
+            try core.rebuild(recreateEngine: true, resume: false)
+            needsEngineRecreation = false
         }
+        currentAudioURL = url
+        try core.load(url: url, volume: volume, startPosition: startPosition)
+        needsGraphRecovery = false
+        core.setEqualizer(gains: equalizerPreset.bandGains, animated: false)
+        sendState("ready")
+        if wantsPlayback && !isInterrupted {
+            try core.play()
+            startProgressTimer()
+            sendState("playing")
+        } else {
+            sendState("paused")
+        }
+        sendProgress()
+        updateNowPlaying()
+    }
 
-        return ["success": true, "position": safeSeconds]
+    private func activateSession() throws {
+        let session = AVAudioSession.sharedInstance()
+        try session.setCategory(.playback, mode: .default, options: [])
+        try session.setActive(true)
     }
 
     private func isCurrentPlaybackRequest(_ requestID: UUID) -> Bool {
         playbackRequestID == requestID
     }
 
-    private func restorePosition(_ seconds: Double, player: AVPlayer, requestID: UUID) async throws {
-        if seconds.isFinite, seconds > 0 {
-            let time = CMTime(seconds: seconds, preferredTimescale: 600)
-            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
-                player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { _ in
-                    continuation.resume()
-                }
-            }
-        }
-        guard isCurrentPlaybackRequest(requestID) else {
+    private func checkRequest(_ requestID: UUID) throws {
+        guard isCurrentPlaybackRequest(requestID), !Task.isCancelled else {
             throw CancellationError()
         }
     }
@@ -375,7 +380,7 @@ final class NativeAudioPlayer {
         return volume
     }
 
-    private static func estimateLoudnessDB(for url: URL) -> Double? {
+    private nonisolated static func estimateLoudnessDB(for url: URL) -> Double? {
         guard let file = try? AVAudioFile(forReading: url) else {
             return nil
         }
@@ -442,7 +447,7 @@ final class NativeAudioPlayer {
         return 10 * log10(gatedEnergy)
     }
 
-    private static func balancedPlaybackVolume(measuredDB: Double?) -> Float {
+    private nonisolated static func balancedPlaybackVolume(measuredDB: Double?) -> Float {
         guard let measuredDB, measuredDB.isFinite else {
             return 1
         }
@@ -450,190 +455,6 @@ final class NativeAudioPlayer {
         let targetDB = -15.0
         let gain = pow(10, (targetDB - measuredDB) / 20)
         return Float(min(1, max(0.72, gain)))
-    }
-
-    private func equalizedPlaybackURL(for url: URL, preset: BMusicEqualizerPreset, requestID: UUID) async -> URL? {
-        guard preset != .off, preset != .flat else {
-            return nil
-        }
-
-        sendState("loading", message: "正在应用均衡器...")
-        let outputURL = await Task.detached(priority: .userInitiated) {
-            Self.renderEqualizedAudio(from: url, preset: preset)
-        }.value
-
-        guard isCurrentPlaybackRequest(requestID) else {
-            if let outputURL {
-                try? FileManager.default.removeItem(at: outputURL)
-            }
-            return nil
-        }
-
-        equalizedTemporaryAudioURL = outputURL
-        return outputURL
-    }
-
-    private static func renderEqualizedAudio(from inputURL: URL, preset: BMusicEqualizerPreset) -> URL? {
-        do {
-            let inputFile = try AVAudioFile(forReading: inputURL)
-            let processingFormat = inputFile.processingFormat
-            guard inputFile.length > 0 else {
-                return nil
-            }
-
-            let engine = AVAudioEngine()
-            let player = AVAudioPlayerNode()
-            let eq = AVAudioUnitEQ(numberOfBands: preset.bandGains.count)
-            let frequencies: [Float] = [32, 64, 125, 250, 500, 1_000, 2_000, 4_000, 8_000, 16_000]
-
-            for (index, gain) in preset.bandGains.enumerated() {
-                let band = eq.bands[index]
-                band.filterType = .parametric
-                band.frequency = frequencies[index]
-                band.bandwidth = 0.5
-                band.gain = gain
-                band.bypass = false
-            }
-
-            engine.attach(player)
-            engine.attach(eq)
-            engine.connect(player, to: eq, format: processingFormat)
-            engine.connect(eq, to: engine.mainMixerNode, format: processingFormat)
-
-            let maximumFrameCount: AVAudioFrameCount = 4096
-            try engine.enableManualRenderingMode(.offline, format: processingFormat, maximumFrameCount: maximumFrameCount)
-            try engine.start()
-
-            player.scheduleFile(inputFile, at: nil)
-            player.play()
-
-            let outputURL = FileManager.default.temporaryDirectory
-                .appendingPathComponent("eno-audio-eq-\(UUID().uuidString)")
-                .appendingPathExtension("caf")
-            let outputFile = try AVAudioFile(forWriting: outputURL, settings: engine.manualRenderingFormat.settings)
-            guard let buffer = AVAudioPCMBuffer(
-                pcmFormat: engine.manualRenderingFormat,
-                frameCapacity: engine.manualRenderingMaximumFrameCount
-            ) else {
-                engine.stop()
-                return nil
-            }
-
-            while engine.manualRenderingSampleTime < inputFile.length {
-                let remainingFrames = inputFile.length - engine.manualRenderingSampleTime
-                let framesToRender = AVAudioFrameCount(min(Int64(engine.manualRenderingMaximumFrameCount), remainingFrames))
-
-                switch try engine.renderOffline(framesToRender, to: buffer) {
-                case .success:
-                    try outputFile.write(from: buffer)
-                case .insufficientDataFromInputNode:
-                    continue
-                case .cannotDoInCurrentContext:
-                    continue
-                case .error:
-                    engine.stop()
-                    try? FileManager.default.removeItem(at: outputURL)
-                    return nil
-                @unknown default:
-                    engine.stop()
-                    try? FileManager.default.removeItem(at: outputURL)
-                    return nil
-                }
-            }
-
-            player.stop()
-            engine.stop()
-            return outputURL
-        } catch {
-            return nil
-        }
-    }
-
-    private func observe(item: AVPlayerItem, player: AVPlayer) {
-        statusObserver = item.observe(\.status, options: [.new]) { [weak self] item, _ in
-            DispatchQueue.main.async {
-                switch item.status {
-                case .readyToPlay:
-                    self?.updateNowPlaying(playbackRate: player.rate)
-                    self?.sendProgress()
-                    self?.sendState("ready")
-                case .failed:
-                    self?.sendState("failed", message: self?.failureMessage(for: item) ?? "播放失败")
-                case .unknown:
-                    self?.sendState("loading")
-                @unknown default:
-                    self?.sendState("unknown")
-                }
-            }
-        }
-
-        timeControlObserver = player.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in
-            DispatchQueue.main.async {
-                switch player.timeControlStatus {
-                case .paused:
-                    self?.updateNowPlaying(playbackRate: 0)
-                    self?.sendState("paused")
-                case .waitingToPlayAtSpecifiedRate:
-                    self?.sendState("buffering")
-                case .playing:
-                    self?.updateNowPlaying(playbackRate: 1)
-                    self?.sendState("playing")
-                @unknown default:
-                    self?.sendState("unknown")
-                }
-            }
-        }
-
-        periodicTimeObserver = player.addPeriodicTimeObserver(
-            forInterval: CMTime(seconds: 0.5, preferredTimescale: 600),
-            queue: .main
-        ) { [weak self] _ in
-            self?.sendProgress()
-        }
-
-        endObserver = NotificationCenter.default.addObserver(
-            forName: .AVPlayerItemDidPlayToEndTime,
-            object: item,
-            queue: .main
-        ) { [weak self] _ in
-            self?.updateNowPlaying(playbackRate: 0)
-            self?.sendState("ended")
-        }
-    }
-
-    private func failureMessage(for item: AVPlayerItem) -> String {
-        var messages: [String] = []
-        if let error = item.error {
-            messages.append(error.localizedDescription)
-        }
-
-        if let events = item.errorLog()?.events, let event = events.last {
-            if let comment = event.errorComment, !comment.isEmpty {
-                messages.append(comment)
-            }
-            if event.errorStatusCode != 0 {
-                messages.append("HTTP \(event.errorStatusCode)")
-            }
-        }
-
-        return messages.isEmpty ? "播放失败" : messages.joined(separator: " · ")
-    }
-
-    private func cleanupObservers() {
-        statusObserver?.invalidate()
-        statusObserver = nil
-        timeControlObserver?.invalidate()
-        timeControlObserver = nil
-
-        if let periodicTimeObserver, let player {
-            player.removeTimeObserver(periodicTimeObserver)
-            self.periodicTimeObserver = nil
-        }
-
-        if let endObserver {
-            NotificationCenter.default.removeObserver(endObserver)
-            self.endObserver = nil
-        }
     }
 
     private func downloadTemporaryAudio(from audioURL: URL, cookie: String) async throws -> URL {
@@ -662,7 +483,7 @@ final class NativeAudioPlayer {
         }
     }
 
-    static func playbackHeaders(cookie: String) -> [String: String] {
+    nonisolated static func playbackHeaders(cookie: String) -> [String: String] {
         var headers = [
             "Referer": "https://www.bilibili.com/",
             "Origin": "https://www.bilibili.com",
@@ -677,10 +498,8 @@ final class NativeAudioPlayer {
     }
 
     private func loadArtwork(from artworkURL: String?) {
-        guard let artworkURL, !artworkURL.isEmpty, let url = URL(string: artworkURL) else {
-            return
-        }
-
+        guard let artworkURL, let url = URL(string: artworkURL) else { return }
+        let requestID = playbackRequestID
         artworkTask = Task { [weak self] in
             do {
                 var request = URLRequest(url: url)
@@ -688,46 +507,26 @@ final class NativeAudioPlayer {
                 for (key, value) in Self.playbackHeaders(cookie: "") {
                     request.setValue(value, forHTTPHeaderField: key)
                 }
-
                 let (data, response) = try await URLSession.shared.data(for: request)
-                guard !Task.isCancelled,
-                      let httpResponse = response as? HTTPURLResponse,
-                      (200...299).contains(httpResponse.statusCode),
-                      let image = UIImage(data: data)
-                else {
-                    return
-                }
-
-                let artwork = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
-                await MainActor.run { [weak self] in
-                    let rate = self?.player?.rate ?? 0
-                    self?.currentArtwork = artwork
-                    self?.updateNowPlaying(playbackRate: rate)
-                }
-            } catch {
-                return
-            }
+                guard let self, !Task.isCancelled, self.isCurrentPlaybackRequest(requestID),
+                      let response = response as? HTTPURLResponse,
+                      (200...299).contains(response.statusCode),
+                      let image = UIImage(data: data) else { return }
+                self.currentArtwork = MPMediaItemArtwork(boundsSize: image.size) { _ in image }
+                self.updateNowPlaying()
+            } catch { return }
         }
     }
 
     private func removeTemporaryAudio() {
-        if let equalizedTemporaryAudioURL {
-            try? FileManager.default.removeItem(at: equalizedTemporaryAudioURL)
-            self.equalizedTemporaryAudioURL = nil
+        if let temporaryAudioURL {
+            try? FileManager.default.removeItem(at: temporaryAudioURL)
+            self.temporaryAudioURL = nil
         }
-
-        guard let temporaryAudioURL else {
-            Self.removeStaleTemporaryAudio()
-            return
-        }
-
-        try? FileManager.default.removeItem(at: temporaryAudioURL)
-        self.temporaryAudioURL = nil
-        Self.removeStaleTemporaryAudio()
     }
 
     @discardableResult
-    static func removeStaleTemporaryAudio() -> (deletedFiles: Int, deletedBytes: Int64) {
+    nonisolated static func removeStaleTemporaryAudio() -> (deletedFiles: Int, deletedBytes: Int64) {
         let manager = FileManager.default
         guard let files = try? manager.contentsOfDirectory(
             at: manager.temporaryDirectory,
@@ -751,7 +550,7 @@ final class NativeAudioPlayer {
         return (deletedFiles, deletedBytes)
     }
 
-    private static func shouldRemoveTemporaryFile(_ file: URL) -> Bool {
+    private nonisolated static func shouldRemoveTemporaryFile(_ file: URL) -> Bool {
         let name = file.lastPathComponent
         if name.hasPrefix(managedTemporaryAudioPrefix) {
             return true
@@ -767,97 +566,207 @@ final class NativeAudioPlayer {
         return Date().timeIntervalSince(modifiedAt) > staleSystemDownloadAge
     }
 
+    private func startProgressTimer() {
+        stopProgressTimer()
+        let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.sendProgress() }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        progressTimer = timer
+    }
+
+    private func stopProgressTimer() {
+        progressTimer?.invalidate()
+        progressTimer = nil
+    }
+
     private func sendState(_ state: String, message: String = "") {
         sendEvent("native-audio-state", [
-            "state": state,
-            "title": currentTitle,
-            "artist": currentArtist,
-            "message": message,
-            "position": player?.currentTime().seconds ?? 0,
-            "duration": playerItem?.duration.seconds.isFinite == true ? playerItem?.duration.seconds ?? 0 : 0
+            "state": state, "title": currentTitle, "artist": currentArtist,
+            "message": message, "position": core.position, "duration": core.duration
         ])
     }
 
     private func sendProgress() {
-        let position = player?.currentTime().seconds ?? 0
-        let duration = playerItem?.duration.seconds ?? 0
         sendEvent("native-audio-progress", [
-            "position": position.isFinite ? position : 0,
-            "duration": duration.isFinite ? duration : 0,
-            "isPlaying": (player?.rate ?? 0) > 0
+            "position": core.position, "duration": core.duration, "isPlaying": core.isPlaying
         ])
     }
 
-    private func updateNowPlaying(playbackRate: Float) {
+    private func updateNowPlaying() {
         var info: [String: Any] = [
             MPMediaItemPropertyTitle: currentTitle,
             MPMediaItemPropertyArtist: currentArtist,
-            MPNowPlayingInfoPropertyPlaybackRate: playbackRate,
-            MPNowPlayingInfoPropertyElapsedPlaybackTime: player?.currentTime().seconds ?? 0
+            MPNowPlayingInfoPropertyPlaybackRate: core.isPlaying ? 1.0 : 0.0,
+            MPNowPlayingInfoPropertyElapsedPlaybackTime: core.position,
+            MPMediaItemPropertyPlaybackDuration: core.duration
         ]
-
-        if let duration = playerItem?.duration.seconds, duration.isFinite {
-            info[MPMediaItemPropertyPlaybackDuration] = duration
-        }
-
-        if let currentArtwork {
-            info[MPMediaItemPropertyArtwork] = currentArtwork
-        }
-
+        if let currentArtwork { info[MPMediaItemPropertyArtwork] = currentArtwork }
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+    }
+
+    private func configureSessionObservers() {
+        let center = NotificationCenter.default
+        sessionObservers.append(center.addObserver(
+            forName: AVAudioSession.interruptionNotification, object: nil, queue: .main
+        ) { [weak self] notification in
+            let type = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
+            let options = notification.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt ?? 0
+            Task { @MainActor [weak self] in
+                self?.handleInterruption(type: type, options: options)
+            }
+        })
+        sessionObservers.append(center.addObserver(
+            forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main
+        ) { [weak self] notification in
+            let reason = notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if reason == AVAudioSession.RouteChangeReason.oldDeviceUnavailable.rawValue {
+                    _ = self.pause()
+                } else {
+                    self.scheduleEngineRecovery(recreateEngine: false)
+                }
+            }
+        })
+        sessionObservers.append(center.addObserver(
+            forName: .AVAudioEngineConfigurationChange, object: nil, queue: .main
+        ) { [weak self] notification in
+            let engine = notification.object as? AVAudioEngine
+            Task { @MainActor [weak self] in
+                guard let self, engine === self.core.audioEngine, !self.isRebuilding else { return }
+                self.scheduleEngineRecovery(recreateEngine: false)
+            }
+        })
+        sessionObservers.append(center.addObserver(
+            forName: AVAudioSession.mediaServicesWereResetNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.scheduleEngineRecovery(recreateEngine: true)
+            }
+        })
+    }
+
+    private func handleInterruption(type: UInt?, options: UInt) {
+        guard let type, let interruption = AVAudioSession.InterruptionType(rawValue: type) else { return }
+        switch interruption {
+        case .began:
+            isInterrupted = true
+            needsGraphRecovery = true
+            resumeAfterInterruption = wantsPlayback
+            recoveryTask?.cancel()
+            core.pause()
+            stopProgressTimer()
+            sendProgress()
+            updateNowPlaying()
+            sendState("paused")
+        case .ended:
+            isInterrupted = false
+            let shouldResume = AVAudioSession.InterruptionOptions(rawValue: options).contains(.shouldResume)
+                && resumeAfterInterruption && wantsPlayback
+            resumeAfterInterruption = false
+            if shouldResume {
+                scheduleEngineRecovery(recreateEngine: false)
+            } else {
+                wantsPlayback = false
+                sendState("paused")
+            }
+        @unknown default:
+            break
+        }
+    }
+
+    private func scheduleEngineRecovery(recreateEngine: Bool) {
+        needsEngineRecreation = needsEngineRecreation || recreateEngine
+        needsGraphRecovery = true
+        guard !isInterrupted else { return }
+        guard core.hasAudio || needsEngineRecreation else { return }
+        guard wantsPlayback else { return }
+        recoveryTask?.cancel()
+        let requestID = playbackRequestID
+        core.pause()
+        stopProgressTimer()
+        updateNowPlaying()
+        if wantsPlayback && core.hasAudio {
+            sendState("buffering", message: "正在恢复音频输出...")
+        }
+        recoveryTask = Task { [weak self] in
+            do { try await Task.sleep(nanoseconds: 150_000_000) }
+            catch { return }
+            guard let self, self.isCurrentPlaybackRequest(requestID), !self.isInterrupted, self.wantsPlayback else { return }
+            self.isRebuilding = true
+            defer { self.isRebuilding = false }
+            do {
+                try self.activateSession()
+                try self.core.rebuild(recreateEngine: self.needsEngineRecreation, resume: self.wantsPlayback)
+                self.needsEngineRecreation = false
+                self.needsGraphRecovery = false
+                if self.core.isPlaying { self.startProgressTimer() }
+                self.sendProgress()
+                self.updateNowPlaying()
+                self.sendState(self.core.isPlaying ? "playing" : "paused")
+            } catch {
+                self.sendState("failed", message: error.localizedDescription)
+            }
+        }
     }
 
     private func configureRemoteCommands() {
         let center = MPRemoteCommandCenter.shared()
-
-        center.playCommand.addTarget { [weak self] _ in
-            self?.player?.play()
-            self?.updateNowPlaying(playbackRate: 1)
-            self?.sendState("playing")
+        addRemoteTarget(center.playCommand) { [weak self] _ in
+            guard let self else { return .commandFailed }
+            _ = self.resume()
             return .success
         }
-
-        center.pauseCommand.addTarget { [weak self] _ in
-            self?.player?.pause()
-            self?.updateNowPlaying(playbackRate: 0)
-            self?.sendState("paused")
+        addRemoteTarget(center.pauseCommand) { [weak self] _ in
+            guard let self else { return .commandFailed }
+            _ = self.pause()
             return .success
         }
-
-        center.togglePlayPauseCommand.addTarget { [weak self] _ in
-            guard let self, let player = self.player else {
+        addRemoteTarget(center.togglePlayPauseCommand) { [weak self] _ in
+            guard let self else { return .commandFailed }
+            if self.wantsPlayback { _ = self.pause() } else { _ = self.resume() }
+            return .success
+        }
+        center.changePlaybackPositionCommand.isEnabled = true
+        addRemoteTarget(center.changePlaybackPositionCommand) { [weak self] event in
+            guard let self, let event = event as? MPChangePlaybackPositionCommandEvent else {
                 return .commandFailed
             }
-
-            if player.rate == 0 {
-                player.play()
-                self.updateNowPlaying(playbackRate: 1)
-                self.sendState("playing")
-            } else {
-                player.pause()
-                self.updateNowPlaying(playbackRate: 0)
-                self.sendState("paused")
-            }
+            _ = self.seek(seconds: event.positionTime)
             return .success
         }
-
         center.nextTrackCommand.isEnabled = true
-        center.nextTrackCommand.addTarget { [weak self] _ in
+        addRemoteTarget(center.nextTrackCommand) { [weak self] _ in
             self?.sendEvent("native-audio-command", ["command": "next"])
             return .success
         }
-
         center.previousTrackCommand.isEnabled = true
-        center.previousTrackCommand.addTarget { [weak self] _ in
+        addRemoteTarget(center.previousTrackCommand) { [weak self] _ in
             self?.sendEvent("native-audio-command", ["command": "previous"])
             return .success
         }
     }
 
+    private func addRemoteTarget(_ command: MPRemoteCommand, handler: @escaping @MainActor (MPRemoteCommandEvent) -> MPRemoteCommandHandlerStatus) {
+        let token = command.addTarget { event in
+            if Thread.isMainThread {
+                return MainActor.assumeIsolated { handler(event) }
+            }
+            DispatchQueue.main.async { _ = handler(event) }
+            return .success
+        }
+        remoteTargets.append((command, token))
+    }
+
     deinit {
         artworkTask?.cancel()
-        cleanupObservers()
-        removeTemporaryAudio()
+        volumeTask?.cancel()
+        recoveryTask?.cancel()
+        progressTimer?.invalidate()
+        for observer in sessionObservers { NotificationCenter.default.removeObserver(observer) }
+        for (command, token) in remoteTargets { command.removeTarget(token) }
+        if let temporaryAudioURL { try? FileManager.default.removeItem(at: temporaryAudioURL) }
     }
 }
 

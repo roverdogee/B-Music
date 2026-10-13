@@ -1,10 +1,12 @@
 # B-Music
 
-当前版本：`0.9.14`。版本变更见 [更新日志](CHANGELOG.md)。
+当前版本：`1.0.0`。版本变更见 [更新日志](CHANGELOG.md)。
+
+1.0.0 使用 AVAudioEngine 实时播放与均衡器，切换预设无需重播或整首转码。正在播放页提供“视频选集”入口，可以查看当前分 P 并切换到同一视频的其他分 P。
 
 B-Music 是一个使用 iOS 原生界面重建的 B 站音乐播放器。项目目标是把 ENO-M iOS 已经验证过的搜索、登录、解析播放、资料库和播放控制能力，改成更接近系统 App 的 SwiftUI 原生体验。
 
-当前工程使用 `SwiftUI`、`AVPlayer`、`MediaPlayer`、`NavigationStack`、`TabView`、`List`、`Sheet` 等 iOS 原生能力构建，不再以 WebView 壳作为主要界面。
+当前工程使用 `SwiftUI`、`AVAudioEngine`、`MediaPlayer`、`NavigationStack`、`TabView`、`List`、`Sheet` 等 iOS 原生能力构建，不再以 WebView 壳作为主要界面。
 
 > 本项目不是 B 站官方客户端，也不包含任何官方授权关系。请仅在个人学习、研究和测试范围内使用，并遵守相关平台规则。
 > 
@@ -26,19 +28,21 @@ B-Music 是一个使用 iOS 原生界面重建的 B 站音乐播放器。项目�
 - 搜索结果作为临时播放列表连续播放
 - 搜索结果、UP 主列表支持全部播放
 - 多 P 视频选集、连续播放和全部加入播放列表
+- 正在播放页显示当前分 P 并可重新打开全部选集
 - 搜索结果可设为当前队列的下一首播放
 - 首页每周 Bilibili 音乐榜
 - 网页登录和二维码登录
 - 登录 Cookie 本地保存
 - B 站视频音频地址解析
-- 原生 `AVPlayer` 音频播放
+- 原生 `AVAudioEngine` 音频播放
 - 播放、暂停、上一首、下一首、进度拖动
 - 后台播放
 - 锁屏 Now Playing 信息
 - 系统远程播放控制
 - 列表循环、单曲循环、随机播放
 - 可配置音量平衡，减小连续切歌时的响度差异
-- 预设均衡器，支持 Apple Music 风格预设、车载预设和 AirPods 预设
+- 实时预设均衡器，支持 Apple Music 风格预设、车载预设和 AirPods 预设
+- 来电等音频中断后的恢复、音频输出变化后的引擎重建和耳机断开时自动暂停
 - 播放过半后预缓存下一首，并在卡顿或失败后自动重试
 - 当前播放迷你栏
 - 正在播放页面
@@ -140,7 +144,7 @@ B-Music 统一了音乐列表的交互：
 
 点击搜索结果、UP 主投稿或榜单里的多 P 视频后，可以选择具体分 P。每一 P 显示自己的标题和时长，点击后以该视频的全部分 P 建立临时队列，从所选分 P 开始播放，支持列表循环、单曲循环和随机播放。
 
-选集页支持全部播放、单 P 收藏、单 P 加入列表，以及将全部分 P 加入我的收藏或自定义播放列表。长按分 P 可以设为下一首播放；在搜索结果中对多 P 视频使用“下一首播放”时，会先让你选择具体分 P。
+选集页支持全部播放、单 P 收藏、单 P 加入列表，以及将全部分 P 加入我的收藏或自定义播放列表。正在播放页的“视频选集”入口显示视频总标题及当前分 P（如 `P1 / 共 12 P`），点击可以重新打开全部分 P，当前播放项带有播放中标记。长按分 P 可以设为下一首播放；在搜索结果中对多 P 视频使用“下一首播放”时，会先让你选择具体分 P。
 
 各分 P 使用 `BV + cid` 作为独立标识，收藏、备份和音频缓存不会把不同分 P 合并。旧版保存的歌曲和列表仍可读取，第一 P 可以复用已有的默认分 P 缓存，不会额外复制音频文件。批量加入保存的是当时已有的分 P，不会自动加入后续新增的分 P。
 
@@ -184,7 +188,11 @@ B-Music 提供音量平衡和预设均衡器两类音频处理能力。
 
 音量平衡用于减少连续切歌时的响度差异。它会分析本地音频片段，优先压低明显过响的歌曲，普通和偏小音量的歌曲尽量保持原始音量。
 
-均衡器提供多组预设，包括 Apple Music 风格的 Acoustic、Bass Booster、Classical、Dance、Electronic、Hip-Hop、Jazz、Pop、Rock、Vocal Booster 等，也包含 `车载音响`、`车载清晰` 和 `AirPods`。均衡器不会修改原始缓存文件，而是为当前播放生成临时处理文件；切换预设后会从下一首开始生效。
+均衡器提供多组预设，包括 Apple Music 风格的 Acoustic、Bass Booster、Classical、Dance、Electronic、Hip-Hop、Jazz、Pop、Rock、Vocal Booster 等，也包含 `车载音响`、`车载清晰` 和 `AirPods`。
+
+播放器通过 `AVAudioPlayerNode → AVAudioUnitEQ → 系统输出` 实时处理原始缓存音频。预设切换即时生效，参数在约 0.18 秒内平滑过渡，不重新下载或转码整首歌曲，也不生成均衡器临时文件。带有频段增益的预设会预留输出余量以减小削波风险；关闭均衡器或选择 Flat 时旁路 EQ。
+
+暂停和进度拖动会保存原始音频的位置并重新调度对应片段。音频中断结束后，仅在系统允许恢复且用户没有手动暂停时恢复播放；耳机断开会暂停播放，输出配置变化和音频服务重置会重建播放链并保留进度。蓝牙、来电和后台行为仍需在实际设备上验证。
 
 ## 性能与体验
 
@@ -210,6 +218,7 @@ B-Music
 │   ├── BiliApiClient.swift
 │   ├── BiliLoginClient.swift
 │   ├── BMusicApp.swift
+│   ├── BMusicAudioEngine.swift
 │   ├── ContentView.swift
 │   ├── CookieStore.swift
 │   ├── Info.plist
@@ -232,7 +241,9 @@ B-Music
 - `BMusic/CookieStore.swift`
   - Keychain Cookie 保存和读取
 - `BMusic/NativeAudioPlayer.swift`
-  - `AVPlayer` 播放、音频下载、后台播放、锁屏信息、远程控制
+  - 音频下载、音量平衡、音频会话、后台播放、锁屏信息和远程控制
+- `BMusic/BMusicAudioEngine.swift`
+  - 实时播放链、均衡器、音频片段调度、进度定位和引擎重建
 - `Scripts/generate_bmusic_icon.swift`
   - 旧版 App 图标生成脚本
 
@@ -261,6 +272,24 @@ swift -module-cache-path Build/SwiftModuleCache Scripts/generate_bmusic_icon.swi
 ```
 
 生成后重新构建项目即可。
+
+## 音频回归检查
+
+在 macOS 上执行：
+
+```sh
+sh Scripts/check_audio_engine.sh
+```
+
+检查会生成测试音频并使用实际 `AVAudioEngine` 离线渲染，验证实时均衡器的频率响应、AAC 播放、实时音量、暂停恢复、进度定位、自然结束、旧回调失效、引擎重建，以及单声道和不同采样率的转换。检查不会通过扬声器播放测试音频。
+
+还可以在已启动的 iOS 模拟器中检查播放与音频会话：
+
+```sh
+sh Scripts/check_audio_session.sh <模拟器UUID>
+```
+
+这项检查使用极低音量的 AAC 测试音频，并通过模拟系统通知检查中断恢复、手动暂停、耳机断开、媒体服务重置和快速切歌。它不能替代真实来电、蓝牙设备和后台场景的真机测试。
 
 ## 数据保存
 

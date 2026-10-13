@@ -13,6 +13,7 @@
 		2D1A001C2C00100100A00001 /* BiliApiClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2D1A001D2C00100100A00001 /* BiliApiClient.swift */; };
 		2D1A001E2C00100100A00001 /* BiliLoginClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2D1A001F2C00100100A00001 /* BiliLoginClient.swift */; };
 		2D1A00202C00100100A00001 /* NativeAudioPlayer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2D1A00212C00100100A00001 /* NativeAudioPlayer.swift */; };
+		2D1A00242C00100100A00001 /* BMusicAudioEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2D1A00252C00100100A00001 /* BMusicAudioEngine.swift */; };
 		2D1A00232C00100100A00001 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 2D1A00222C00100100A00001 /* Assets.xcassets */; };
 /* End PBXBuildFile section */
 
@@ -25,6 +26,7 @@
 		2D1A001D2C00100100A00001 /* BiliApiClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BiliApiClient.swift; sourceTree = "<group>"; };
 		2D1A001F2C00100100A00001 /* BiliLoginClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BiliLoginClient.swift; sourceTree = "<group>"; };
 		2D1A00212C00100100A00001 /* NativeAudioPlayer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeAudioPlayer.swift; sourceTree = "<group>"; };
+		2D1A00252C00100100A00001 /* BMusicAudioEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BMusicAudioEngine.swift; sourceTree = "<group>"; };
 		2D1A00222C00100100A00001 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
@@ -64,6 +66,7 @@
 				2D1A001D2C00100100A00001 /* BiliApiClient.swift */,
 				2D1A001F2C00100100A00001 /* BiliLoginClient.swift */,
 				2D1A00212C00100100A00001 /* NativeAudioPlayer.swift */,
+				2D1A00252C00100100A00001 /* BMusicAudioEngine.swift */,
 				2D1A000A2C00100100A00001 /* Info.plist */,
 				2D1A00222C00100100A00001 /* Assets.xcassets */,
 			);
@@ -145,6 +148,7 @@
 				2D1A001C2C00100100A00001 /* BiliApiClient.swift in Sources */,
 				2D1A001E2C00100100A00001 /* BiliLoginClient.swift in Sources */,
 				2D1A00202C00100100A00001 /* NativeAudioPlayer.swift in Sources */,
+				2D1A00242C00100100A00001 /* BMusicAudioEngine.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -286,7 +290,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 0.9.14;
+				MARKETING_VERSION = 1.0.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.b.music.ios;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
@@ -310,7 +314,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 0.9.14;
+				MARKETING_VERSION = 1.0.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.b.music.ios;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
