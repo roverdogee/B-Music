@@ -167,8 +167,8 @@ final class NativeAudioPlayer {
         equalizerPreset = preset
     }
 
-    func playCached(cacheID: String, title: String?, artist: String?, artworkURL: String?) async throws -> Bool {
-        guard let localURL = await BMusicAudioCache.shared.cachedURL(for: cacheID) else {
+    func playCached(cacheID: String, title: String?, artist: String?, artworkURL: String?, startPosition: Double = 0, legacyCacheID: String? = nil) async throws -> Bool {
+        guard let localURL = await BMusicAudioCache.shared.cachedURL(for: cacheID, legacyID: legacyCacheID) else {
             return false
         }
 
@@ -206,6 +206,7 @@ final class NativeAudioPlayer {
         player.volume = volume
         self.playerItem = item
         self.player = player
+        try await restorePosition(startPosition, player: player, requestID: requestID)
         observe(item: item, player: player)
         updateNowPlaying(playbackRate: 1)
         sendState("loading")
@@ -214,7 +215,7 @@ final class NativeAudioPlayer {
         return true
     }
 
-    func play(url: String, title: String?, artist: String?, artworkURL: String?, cookie: String = "", cacheID: String? = nil) async throws -> Any {
+    func play(url: String, title: String?, artist: String?, artworkURL: String?, cookie: String = "", cacheID: String? = nil, startPosition: Double = 0) async throws -> Any {
         guard let audioURL = URL(string: url) else {
             throw NativeAudioError.invalidURL
         }
@@ -275,6 +276,7 @@ final class NativeAudioPlayer {
         player.volume = volume
         self.playerItem = item
         self.player = player
+        try await restorePosition(startPosition, player: player, requestID: requestID)
         observe(item: item, player: player)
         updateNowPlaying(playbackRate: 1)
         sendState("loading")
@@ -335,6 +337,20 @@ final class NativeAudioPlayer {
 
     private func isCurrentPlaybackRequest(_ requestID: UUID) -> Bool {
         playbackRequestID == requestID
+    }
+
+    private func restorePosition(_ seconds: Double, player: AVPlayer, requestID: UUID) async throws {
+        if seconds.isFinite, seconds > 0 {
+            let time = CMTime(seconds: seconds, preferredTimescale: 600)
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero) { _ in
+                    continuation.resume()
+                }
+            }
+        }
+        guard isCurrentPlaybackRequest(requestID) else {
+            throw CancellationError()
+        }
     }
 
     private func playbackVolume(for url: URL, requestID: UUID) async -> Float {
@@ -860,6 +876,7 @@ actor BMusicAudioCache {
     private var entries: [String: BMusicAudioCacheEntry] = [:]
     private var activePlaybackDownloadTask: URLSessionDownloadTask?
     private var activePlaybackDownloadToken: UUID?
+    private var pendingDownloads: [String: Task<URL, Error>] = [:]
 
     private init() {
         let manager = FileManager.default
@@ -881,24 +898,40 @@ actor BMusicAudioCache {
             return cachedURL
         }
 
+        // Playback and background caching share one download for each song.
+        if let pending = pendingDownloads[id] {
+            return try await pending.value
+        }
+
         if cancelingActivePlaybackDownload {
             cancelActivePlaybackDownload()
         }
 
-        let temporaryURL = try await downloadAudio(
-            from: sourceURL,
-            cookie: cookie,
-            tracksPlaybackDownload: cancelingActivePlaybackDownload
-        )
-        do {
-            return try storeDownloadedAudio(at: temporaryURL, for: id)
-        } catch {
-            try? fileManager.removeItem(at: temporaryURL)
-            throw error
+        let pending = Task {
+            let temporaryURL = try await self.downloadAudio(
+                from: sourceURL,
+                cookie: cookie,
+                tracksPlaybackDownload: cancelingActivePlaybackDownload
+            )
+            do {
+                return try self.storeDownloadedAudio(at: temporaryURL, for: id)
+            } catch {
+                try? self.fileManager.removeItem(at: temporaryURL)
+                throw error
+            }
         }
+        pendingDownloads[id] = pending
+        defer { pendingDownloads[id] = nil }
+        return try await pending.value
     }
 
-    func cachedURL(for id: String) -> URL? {
+    func cachedURL(for id: String, legacyID: String? = nil) -> URL? {
+        if entries[id] == nil, let legacyID, let legacyURL = cachedURL(for: legacyID),
+           let legacy = entries[legacyID] {
+            entries[id] = BMusicAudioCacheEntry(id: id, fileName: legacy.fileName, lastAccessed: Date())
+            saveEntries()
+            return legacyURL
+        }
         guard var entry = entries[id] else {
             return nil
         }
@@ -917,26 +950,24 @@ actor BMusicAudioCache {
     }
 
     func prune(keeping keepIDs: Set<String>) {
+        let retainedFiles = Set(entries.filter { keepIDs.contains($0.key) }.map { $0.value.fileName })
         for (id, entry) in entries where !keepIDs.contains(id) {
             let url = cacheDirectory.appendingPathComponent(entry.fileName)
-            try? fileManager.removeItem(at: url)
+            if !retainedFiles.contains(entry.fileName) {
+                try? fileManager.removeItem(at: url)
+            }
             entries[id] = nil
         }
         saveEntries()
     }
 
     func clear(keeping keepIDs: Set<String> = []) {
-        for (id, entry) in entries where !keepIDs.contains(id) {
-            let url = cacheDirectory.appendingPathComponent(entry.fileName)
-            try? fileManager.removeItem(at: url)
-            entries[id] = nil
-        }
-        saveEntries()
+        prune(keeping: keepIDs)
     }
 
     func sizeInBytes() -> Int64 {
-        entries.reduce(into: Int64(0)) { total, pair in
-            let url = cacheDirectory.appendingPathComponent(pair.value.fileName)
+        Set(entries.values.map(\.fileName)).reduce(into: Int64(0)) { total, fileName in
+            let url = cacheDirectory.appendingPathComponent(fileName)
             guard let values = try? url.resourceValues(forKeys: [.fileSizeKey]) else {
                 return
             }
@@ -1003,7 +1034,15 @@ actor BMusicAudioCache {
                     return
                 }
 
-                continuation.resume(returning: (temporaryURL, response, token))
+                // URLSession owns the original file only until this callback returns.
+                let retainedURL = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("eno-audio-\(UUID().uuidString).m4a")
+                do {
+                    try FileManager.default.moveItem(at: temporaryURL, to: retainedURL)
+                    continuation.resume(returning: (retainedURL, response, token))
+                } catch {
+                    continuation.resume(throwing: error)
+                }
             }
 
             if tracksPlaybackDownload {

@@ -111,6 +111,15 @@ struct ContentView: View {
         .sheet(isPresented: $viewModel.showPlayer) {
             PlayerScreen(viewModel: viewModel)
                 .presentationDetents([.large])
+                .sheet(isPresented: $viewModel.showVideoParts) {
+                    VideoPartsScreen(viewModel: viewModel)
+                }
+        }
+        .sheet(isPresented: Binding(
+            get: { viewModel.showVideoParts && !viewModel.showPlayer },
+            set: { viewModel.showVideoParts = $0 }
+        )) {
+            VideoPartsScreen(viewModel: viewModel)
         }
         .task {
             await viewModel.refreshUser()
@@ -1095,8 +1104,91 @@ private struct InteractivePopGestureEnabler: UIViewControllerRepresentable {
     }
 }
 
+private struct VideoPartsScreen: View {
+    @ObservedObject var viewModel: BMusicViewModel
+    @State private var showPlaylistPicker = false
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    if !viewModel.selectsPartForNextPlayback {
+                        Button {
+                            if let first = viewModel.selectedVideoParts.first {
+                                Task { await viewModel.playSelectedPart(first) }
+                            }
+                        } label: {
+                            Label("全部播放", systemImage: "play.fill")
+                        }
+                    }
+                    Button {
+                        viewModel.preparePartsPlaylistPicker(viewModel.selectedVideoParts)
+                        showPlaylistPicker = true
+                    } label: {
+                        Label("全部加入播放列表", systemImage: "text.badge.plus")
+                    }
+                } header: {
+                    Text(viewModel.selectedVideoParts.first?.videoTitle ?? "")
+                }
+                Section("共 \(viewModel.selectedVideoParts.count) P") {
+                    ForEach(viewModel.selectedVideoParts) { item in
+                        HStack(spacing: 8) {
+                            Text("P\(item.partNumber ?? 1)")
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                                .frame(width: 32)
+                            VideoRow(
+                                item: item,
+                                isCurrent: viewModel.currentItem?.id == item.id,
+                                favoriteSystemImage: viewModel.isFavorite(item) ? "heart.fill" : "heart"
+                            ) {
+                                Task { await viewModel.playSelectedPart(item) }
+                            } favoriteAction: {
+                                viewModel.toggleFavorite(item)
+                            } addAction: {
+                                viewModel.preparePartsPlaylistPicker([item])
+                                showPlaylistPicker = true
+                            }
+                        }
+                        .contextMenu {
+                            Button {
+                                viewModel.playNextInQueue(item)
+                                viewModel.showVideoParts = false
+                            } label: {
+                                Label("下一首播放", systemImage: "text.line.first.and.arrowtriangle.forward")
+                            }
+                        }
+                    }
+                }
+            }
+            .listStyle(.insetGrouped)
+            .navigationTitle(viewModel.selectsPartForNextPlayback ? "选择下一首" : "选集")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("关闭") { viewModel.showVideoParts = false }
+                }
+            }
+            .sheet(isPresented: $showPlaylistPicker) {
+                NavigationStack {
+                    PlaylistPickerScreen(viewModel: viewModel)
+                        .navigationTitle("加入播放列表")
+                        .navigationBarTitleDisplayMode(.inline)
+                        .toolbar {
+                            ToolbarItem(placement: .topBarTrailing) {
+                                Button("完成") { showPlaylistPicker = false }
+                            }
+                        }
+                }
+                .presentationDetents([.medium, .large])
+            }
+        }
+    }
+}
+
 private struct PlaylistPickerScreen: View {
     @ObservedObject var viewModel: BMusicViewModel
+    @Environment(\.dismiss) private var dismiss
     @State private var newPlaylistName = ""
 
     var body: some View {
@@ -1104,12 +1196,18 @@ private struct PlaylistPickerScreen: View {
             PlayerDynamicBackground(item: viewModel.playlistPickerItem ?? viewModel.currentItem)
 
             List {
-                if let item = viewModel.playlistPickerItem {
+                if viewModel.playlistPickerItems.count > 1 {
+                    Section {
+                        Label("已选择 \(viewModel.playlistPickerItems.count) 首", systemImage: "music.note.list")
+                    }
+                    .listRowBackground(PlaylistPickerRowBackground())
+                } else if let item = viewModel.playlistPickerItem {
                     Section {
                         VideoRow(item: item, isCurrent: viewModel.currentItem?.id == item.id, showsPlayButton: false, showsActionButton: false) {
                             Task { await viewModel.play(item) }
                         } addAction: {
                             viewModel.showPlaylistPicker = false
+                            dismiss()
                         }
                     }
                     .listRowBackground(PlaylistPickerRowBackground())
@@ -1117,10 +1215,9 @@ private struct PlaylistPickerScreen: View {
 
                 Section("已有播放列表") {
                     Button {
-                        if let item = viewModel.playlistPickerItem {
-                            viewModel.addFavorite(item)
-                        }
+                        viewModel.addPickerItems(toPlaylist: nil)
                         viewModel.showPlaylistPicker = false
+                        dismiss()
                     } label: {
                         HStack {
                             VStack(alignment: .leading, spacing: 4) {
@@ -1139,10 +1236,9 @@ private struct PlaylistPickerScreen: View {
 
                     ForEach(viewModel.playlists) { playlist in
                         Button {
-                            if let item = viewModel.playlistPickerItem {
-                                viewModel.add(item, toPlaylist: playlist.id)
-                            }
+                            viewModel.addPickerItems(toPlaylist: playlist.id)
                             viewModel.showPlaylistPicker = false
+                            dismiss()
                         } label: {
                             HStack {
                                 VStack(alignment: .leading, spacing: 4) {
@@ -1165,9 +1261,13 @@ private struct PlaylistPickerScreen: View {
                     HStack {
                         TextField("播放列表名称", text: $newPlaylistName)
                         Button("创建并加入") {
-                            viewModel.createPlaylist(named: newPlaylistName, adding: viewModel.playlistPickerItem)
+                            viewModel.createPlaylist(named: newPlaylistName)
+                            if let playlist = viewModel.playlists.first {
+                                viewModel.addPickerItems(toPlaylist: playlist.id)
+                            }
                             newPlaylistName = ""
                             viewModel.showPlaylistPicker = false
+                            dismiss()
                         }
                         .disabled(newPlaylistName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     }
@@ -1680,15 +1780,23 @@ private struct MusicRow: View {
         ) {
             Task {
                 if let queueContext {
-                    await viewModel.play(item, in: queueContext)
+                    await viewModel.selectVideo(item, in: queueContext)
                 } else {
-                    await viewModel.play(item)
+                    await viewModel.selectVideo(item)
                 }
             }
         } favoriteAction: {
             viewModel.toggleFavorite(item)
         } addAction: {
             viewModel.showPlaylistPicker(for: item)
+        }
+        .contextMenu {
+            Button {
+                Task { await viewModel.selectVideo(item, playNext: true) }
+            } label: {
+                Label("下一首播放", systemImage: "text.line.first.and.arrowtriangle.forward")
+            }
+            .disabled(viewModel.currentItem?.id == item.id)
         }
     }
 }
@@ -1704,11 +1812,28 @@ private struct SearchResultRow: View {
             actionSystemImage: "plus",
             favoriteSystemImage: viewModel.isFavorite(item) ? "heart.fill" : "heart"
         ) {
-            Task { await viewModel.playSearchResult(item) }
+            Task { await viewModel.selectVideo(item, isSearchResult: true) }
         } favoriteAction: {
             viewModel.toggleFavorite(item)
         } addAction: {
             viewModel.showPlaylistPicker(for: item)
+        }
+        .contextMenu {
+            Button {
+                Task { await viewModel.selectVideo(item, playNext: true) }
+            } label: {
+                Label("下一首播放", systemImage: "text.line.first.and.arrowtriangle.forward")
+            }
+            .disabled(viewModel.currentItem?.id == item.id)
+        }
+        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+            Button {
+                Task { await viewModel.selectVideo(item, playNext: true) }
+            } label: {
+                Label("下一首播放", systemImage: "text.line.first.and.arrowtriangle.forward")
+            }
+            .tint(.teal)
+            .disabled(viewModel.currentItem?.id == item.id)
         }
     }
 }
@@ -1733,7 +1858,7 @@ private struct RankedMusicRow: View {
                 showsPlayButton: false,
                 favoriteSystemImage: viewModel.isFavorite(item) ? "heart.fill" : "heart"
             ) {
-                Task { await viewModel.play(item, in: queueContext) }
+                Task { await viewModel.selectVideo(item, in: queueContext) }
             } favoriteAction: {
                 viewModel.toggleFavorite(item)
             } addAction: {
@@ -2462,6 +2587,10 @@ final class BMusicViewModel: ObservableObject {
     @Published var equalizerPreset: BMusicEqualizerPreset = .off
     @Published var showPlaylistPicker = false
     @Published var playlistPickerItem: BMusicVideo?
+    @Published var playlistPickerItems: [BMusicVideo] = []
+    @Published var showVideoParts = false
+    @Published var selectedVideoParts: [BMusicVideo] = []
+    @Published var selectsPartForNextPlayback = false
     @Published var cachesRecentPlays = true
     @Published var cachesFavorites = false
     @Published var cachedPlaylistIDs: Set<UUID> = []
@@ -2489,12 +2618,16 @@ final class BMusicViewModel: ObservableObject {
     private var loginTask: Task<Void, Never>?
     private var lastWebLoginCookie = ""
     private var playbackRequestID = UUID()
+    private var videoSelectionRequestID = UUID()
+    private var videoPartsCache: [String: [BMusicVideo]] = [:]
+    private var videoDetailsCache: [String: BMusicVideo] = [:]
     private var currentQueueIndex: Int?
     private var queueBaseline: [BMusicVideo] = []
     private var activeSearchQueueKeyword: String?
     private var loadedSearchResults: [BMusicVideo] = []
     private var audioCacheTask: Task<Void, Never>?
     private var playbackRecoveryTask: Task<Void, Never>?
+    private var playbackRecoveryPosition: Double = 0
     private var nextAudioPrefetchTask: Task<Void, Never>?
     private var prefetchedAudioIDs: Set<String> = []
     private var prefetchingAudioIDs: Set<String> = []
@@ -2550,12 +2683,7 @@ final class BMusicViewModel: ObservableObject {
 
     var appVersionText: String {
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
-        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
-        let versionText = version.flatMap { $0.isEmpty ? nil : $0 } ?? "未知"
-        guard let build, !build.isEmpty else {
-            return versionText
-        }
-        return "\(versionText) (\(build))"
+        return version.flatMap { $0.isEmpty ? nil : $0 } ?? "未知"
     }
 
     init() {
@@ -2796,6 +2924,40 @@ final class BMusicViewModel: ObservableObject {
         queueBaseline.append(item)
         queue.append(item)
         saveLibrary()
+    }
+
+    func playNextInQueue(_ item: BMusicVideo) {
+        guard currentItem?.id != item.id else { return }
+
+        activeSearchQueueKeyword = nil
+        nextAudioPrefetchTask?.cancel()
+        nextAudioPrefetchTask = nil
+        if queueBaseline.isEmpty {
+            queueBaseline = queue
+        }
+
+        queue.removeAll { $0.id == item.id }
+        queueBaseline.removeAll { $0.id == item.id }
+        if let currentItem {
+            if !queue.contains(where: { $0.id == currentItem.id }) {
+                queue.insert(currentItem, at: 0)
+            }
+            if !queueBaseline.contains(where: { $0.id == currentItem.id }) {
+                queueBaseline.insert(currentItem, at: 0)
+            }
+        }
+
+        let queueInsertion = currentItem.flatMap { current in
+            queue.firstIndex { $0.id == current.id }.map { $0 + 1 }
+        } ?? 0
+        let baselineInsertion = currentItem.flatMap { current in
+            queueBaseline.firstIndex { $0.id == current.id }.map { $0 + 1 }
+        } ?? 0
+        queue.insert(item, at: queueInsertion)
+        queueBaseline.insert(item, at: baselineInsertion)
+        syncCurrentQueueIndex()
+        saveLibrary()
+        maybePrefetchNextAudio(position: playbackProgress.position, duration: playbackProgress.duration)
     }
 
     func removeFromQueue(_ item: BMusicVideo) {
@@ -3245,7 +3407,87 @@ final class BMusicViewModel: ObservableObject {
 
     func showPlaylistPicker(for item: BMusicVideo) {
         playlistPickerItem = item
+        playlistPickerItems = [item]
         showPlaylistPicker = true
+    }
+
+    func preparePartsPlaylistPicker(_ items: [BMusicVideo]) {
+        playlistPickerItems = items
+        playlistPickerItem = items.first
+    }
+
+    func addPickerItems(toPlaylist playlistID: UUID?) {
+        let items = Self.deduplicatedVideos(playlistPickerItems)
+        let ids = Set(items.map(\.id))
+        if let playlistID, let index = playlists.firstIndex(where: { $0.id == playlistID }) {
+            playlists[index].items.removeAll { ids.contains($0.id) }
+            playlists[index].items.insert(contentsOf: items, at: 0)
+        } else if playlistID == nil {
+            let additions = items.filter { !isFavorite($0) }
+            favorites.insert(contentsOf: additions, at: 0)
+        }
+        saveLibrary()
+        if (playlistID == nil && cachesFavorites) || playlistID.map({ cachedPlaylistIDs.contains($0) }) == true {
+            warmConfiguredAudioCache()
+        }
+    }
+
+    func selectVideo(_ item: BMusicVideo, in context: [BMusicVideo]? = nil, isSearchResult: Bool = false, playNext: Bool = false) async {
+        let requestID = UUID()
+        videoSelectionRequestID = requestID
+        var selected = item
+        if item.partNumber == nil {
+            do {
+                let parts: [BMusicVideo]
+                if let cached = videoPartsCache[item.bvid] {
+                    parts = cached
+                } else {
+                    let response = try await apiClient.request(payload: [
+                        "contentScriptQuery": "getVideoInfo", "bvid": item.bvid
+                    ])
+                    parts = BMusicVideo.parts(from: response, fallback: item)
+                    guard videoSelectionRequestID == requestID else { return }
+                    guard let detail = BMusicVideo.detail(from: response, fallback: item) else {
+                        throw BMusicError.invalidVideo
+                    }
+                    videoDetailsCache[item.bvid] = detail
+                    videoPartsCache[item.bvid] = parts
+                }
+                if parts.count > 1 {
+                    selectedVideoParts = parts
+                    selectsPartForNextPlayback = playNext
+                    showVideoParts = true
+                    return
+                }
+                selected = videoDetailsCache[item.bvid] ?? item
+            } catch {
+                guard videoSelectionRequestID == requestID else { return }
+                if await BMusicAudioCache.shared.cachedURL(for: item.id) == nil {
+                    errorMessage = error.localizedDescription
+                    return
+                }
+            }
+        }
+        guard videoSelectionRequestID == requestID else { return }
+        if playNext {
+            playNextInQueue(selected)
+        } else if isSearchResult {
+            await playSearchResult(selected)
+        } else if let context {
+            await play(selected, in: context)
+        } else {
+            await play(selected)
+        }
+    }
+
+    func playSelectedPart(_ item: BMusicVideo) async {
+        let parts = selectedVideoParts
+        showVideoParts = false
+        if selectsPartForNextPlayback {
+            playNextInQueue(item)
+        } else {
+            await play(item, in: parts)
+        }
     }
 
     func playlist(id: UUID) -> BMusicPlaylist? {
@@ -3343,6 +3585,16 @@ final class BMusicViewModel: ObservableObject {
     }
 
     private func startPlayback(_ item: BMusicVideo, automaticRetry: Bool) async {
+        videoSelectionRequestID = UUID()
+        if automaticRetry {
+            let position = playbackProgress.position
+            if position.isFinite {
+                playbackRecoveryPosition = max(playbackRecoveryPosition, position)
+            }
+        } else {
+            playbackRecoveryPosition = 0
+        }
+        let startPosition = playbackRecoveryPosition
         let requestID = UUID()
         playbackRequestID = requestID
         playbackRecoveryTask?.cancel()
@@ -3369,6 +3621,7 @@ final class BMusicViewModel: ObservableObject {
         let loadingDetail = automaticRetry ? "正在重新连接..." : "正在获取音频地址..."
         playbackDetail = loadingDetail
         playbackProgress.reset(detail: loadingDetail)
+        playbackProgress.update(position: startPosition)
         defer {
             if isCurrentPlaybackRequest(requestID) {
                 isResolvingPlayback = false
@@ -3380,15 +3633,18 @@ final class BMusicViewModel: ObservableObject {
                 cacheID: item.id,
                 title: item.title,
                 artist: item.author,
-                artworkURL: item.coverURL?.absoluteString
+                artworkURL: item.coverURL?.absoluteString,
+                startPosition: startPosition,
+                legacyCacheID: item.partNumber == 1 ? item.bvid : nil
             ) {
                 guard isCurrentPlaybackRequest(requestID) else {
                     return
                 }
                 currentItem = item
+                playbackRecoveryPosition = 0
                 addRecentlyPlayed(item)
                 playbackDetail = "使用本地缓存播放"
-                playbackProgress.reset(detail: "使用本地缓存播放")
+                playbackProgress.update(position: startPosition, detail: "使用本地缓存播放")
                 maybePrefetchNextAudio(position: playbackProgress.position, duration: playbackProgress.duration)
                 return
             }
@@ -3407,11 +3663,13 @@ final class BMusicViewModel: ObservableObject {
                 artist: resolved.video.author,
                 artworkURL: resolved.video.coverURL?.absoluteString,
                 cookie: cookieStore.read(),
-                cacheID: resolved.video.id
+                cacheID: resolved.video.id,
+                startPosition: startPosition
             )
             guard isCurrentPlaybackRequest(requestID) else {
                 return
             }
+            playbackRecoveryPosition = 0
         } catch where error.isCancellation {
             if isCurrentPlaybackRequest(requestID) {
                 playbackStateText = "空闲"
@@ -3425,6 +3683,7 @@ final class BMusicViewModel: ObservableObject {
             playbackStateText = "播放失败"
             playbackDetail = error.localizedDescription
             playbackProgress.reset(detail: error.localizedDescription)
+            playbackProgress.update(position: startPosition)
             errorMessage = error.localizedDescription
             schedulePlaybackRecovery(for: item, requestID: requestID, message: "播放失败，10 秒后自动重试...")
         }
@@ -3714,6 +3973,9 @@ final class BMusicViewModel: ObservableObject {
     }
 
     private func cacheAudio(_ item: BMusicVideo) async throws {
+        if await BMusicAudioCache.shared.cachedURL(for: item.id, legacyID: item.partNumber == 1 ? item.bvid : nil) != nil {
+            return
+        }
         let resolved = try await resolvePlayableVideo(item)
         guard let audioURL = URL(string: resolved.audioURL) else {
             throw NativeAudioError.invalidURL
@@ -4014,13 +4276,20 @@ final class BMusicViewModel: ObservableObject {
         var cid = item.cid
 
         if cid == nil {
-            let response = try await apiClient.request(payload: [
-                "contentScriptQuery": "getVideoInfo",
-                "bvid": item.bvid
-            ])
-            if let detail = BMusicVideo.detail(from: response, fallback: item) {
+            if let detail = videoDetailsCache[item.bvid] {
                 video = detail
                 cid = detail.cid
+            } else {
+                let response = try await apiClient.request(payload: [
+                    "contentScriptQuery": "getVideoInfo",
+                    "bvid": item.bvid
+                ])
+                if let detail = BMusicVideo.detail(from: response, fallback: item) {
+                    video = detail
+                    cid = detail.cid
+                    videoDetailsCache[item.bvid] = detail
+                    videoPartsCache[item.bvid] = BMusicVideo.parts(from: response, fallback: detail)
+                }
             }
         }
 
@@ -4059,6 +4328,15 @@ final class BMusicViewModel: ObservableObject {
         hasMore = false
         page = 1
         activeSearchQueueKeyword = nil
+        let parts = BMusicVideo.parts(from: response, fallback: video)
+        videoPartsCache[bvid] = parts
+        videoDetailsCache[bvid] = video
+        if parts.count > 1 {
+            selectedVideoParts = parts
+            selectsPartForNextPlayback = false
+            showVideoParts = true
+            return
+        }
         applyQueueContext([video], currentItem: video)
         await play(video)
     }
@@ -4110,7 +4388,7 @@ final class BMusicViewModel: ObservableObject {
 }
 
 struct BMusicVideo: Codable, Identifiable, Hashable {
-    let id: String
+    var id: String
     let bvid: String
     var cid: Int?
     var title: String
@@ -4120,6 +4398,8 @@ struct BMusicVideo: Codable, Identifiable, Hashable {
     var duration: String
     var playCount: Int?
     var publishedAt: Int?
+    var partNumber: Int?
+    var videoTitle: String?
 
     private init(
         id: String,
@@ -4198,8 +4478,10 @@ struct BMusicVideo: Codable, Identifiable, Hashable {
         }
 
         var video = fallback
-        video.cid = data.intValue(for: "cid")
-        video.title = (data["title"] as? String)?.cleanedHTML() ?? fallback.title
+        if fallback.partNumber == nil {
+            video.cid = data.intValue(for: "cid")
+            video.title = (data["title"] as? String)?.cleanedHTML() ?? fallback.title
+        }
         video.cover = data["pic"] as? String ?? fallback.cover
         if let owner = data["owner"] as? [String: Any],
            let name = owner["name"] as? String,
@@ -4207,10 +4489,32 @@ struct BMusicVideo: Codable, Identifiable, Hashable {
             video.author = name
             video.authorID = owner.intValue(for: "mid") ?? fallback.authorID
         }
-        if let duration = data.intValue(for: "duration") {
+        if fallback.partNumber == nil, let duration = data.intValue(for: "duration") {
             video.duration = Double(duration).durationText
         }
         return video
+    }
+
+    static func parts(from response: Any, fallback: BMusicVideo) -> [BMusicVideo] {
+        guard let root = response as? [String: Any],
+              let data = root["data"] as? [String: Any],
+              let pages = data["pages"] as? [[String: Any]],
+              let detail = detail(from: response, fallback: fallback)
+        else { return [] }
+        return pages.enumerated().compactMap { index, page in
+            guard let cid = page.intValue(for: "cid"), cid > 0 else { return nil }
+            var part = detail
+            part.id = "\(detail.bvid)_\(cid)"
+            part.cid = cid
+            part.partNumber = page.intValue(for: "page") ?? index + 1
+            part.videoTitle = detail.title
+            let title = (page["part"] as? String ?? "").cleanedHTML()
+            part.title = title.isEmpty ? "P\(part.partNumber ?? index + 1) · \(detail.title)" : title
+            if let duration = page.intValue(for: "duration") {
+                part.duration = Double(duration).durationText
+            }
+            return part
+        }
     }
 
     static func bestAudioURL(from response: Any) -> String? {
