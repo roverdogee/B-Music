@@ -2749,7 +2749,10 @@ final class BMusicViewModel: ObservableObject {
 
     var appVersionText: String {
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
-        return version.flatMap { $0.isEmpty ? nil : $0 } ?? "未知"
+        let versionText = version.flatMap { $0.isEmpty ? nil : $0 } ?? "未知"
+        let suffix = (Bundle.main.object(forInfoDictionaryKey: "BMusicVersionSuffix") as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return suffix.isEmpty ? versionText : "\(versionText) \(suffix)"
     }
 
     var currentVideoParts: [BMusicVideo] {

@@ -147,10 +147,13 @@ final class NativeAudioPlayer {
     private var balancedVolumes: [String: Float] = [:]
     private var wantsPlayback = false
     private var isInterrupted = false
+    private var interruptionGeneration = 0
+    private var playbackInterruptionGeneration = 0
     private var resumeAfterInterruption = false
     private var isRebuilding = false
     private var needsEngineRecreation = false
     private var needsGraphRecovery = false
+    private var needsSessionReset = false
     private var progressTimer: Timer?
     private var sessionObservers: [NSObjectProtocol] = []
     private var remoteTargets: [(MPRemoteCommand, Any)] = []
@@ -249,16 +252,18 @@ final class NativeAudioPlayer {
 
     func resume() -> Any {
         wantsPlayback = true
-        guard !isInterrupted, core.hasAudio else { return ["success": true] }
         do {
             recoveryTask?.cancel()
+            playbackInterruptionGeneration = interruptionGeneration
+            if isInterrupted { needsEngineRecreation = true }
             try activateSession()
+            guard core.hasAudio else { return ["success": true] }
             if needsGraphRecovery || needsEngineRecreation {
                 try core.rebuild(recreateEngine: needsEngineRecreation, resume: false)
                 needsEngineRecreation = false
                 needsGraphRecovery = false
             }
-            try core.play()
+            try startCorePlayback()
             startProgressTimer()
             updateNowPlaying()
             sendState("playing")
@@ -312,6 +317,8 @@ final class NativeAudioPlayer {
         currentTitle = title ?? ""
         currentArtist = artist ?? ""
         wantsPlayback = true
+        playbackInterruptionGeneration = interruptionGeneration
+        if isInterrupted { needsEngineRecreation = true }
         resumeAfterInterruption = isInterrupted
         loadArtwork(from: artworkURL)
         updateNowPlaying()
@@ -321,7 +328,7 @@ final class NativeAudioPlayer {
     private func prepareAudio(at url: URL, startPosition: Double, requestID: UUID) async throws {
         let volume = await playbackVolume(for: url, requestID: requestID)
         try checkRequest(requestID)
-        if !isInterrupted { try activateSession() }
+        if !isInterrupted || playbackInterruptionGeneration == interruptionGeneration { try activateSession() }
         if needsEngineRecreation {
             try core.rebuild(recreateEngine: true, resume: false)
             needsEngineRecreation = false
@@ -332,7 +339,7 @@ final class NativeAudioPlayer {
         core.setEqualizer(gains: equalizerPreset.bandGains, animated: false)
         sendState("ready")
         if wantsPlayback && !isInterrupted {
-            try core.play()
+            try startCorePlayback()
             startProgressTimer()
             sendState("playing")
         } else {
@@ -344,8 +351,49 @@ final class NativeAudioPlayer {
 
     private func activateSession() throws {
         let session = AVAudioSession.sharedInstance()
-        try session.setCategory(.playback, mode: .default, options: [])
+        if needsSessionReset {
+            logAudioRoute("before session reset")
+            stopProgressTimer()
+            core.suspendOutput()
+            do {
+                try session.setActive(false)
+            } catch {
+                let failure = error as NSError
+                guard failure.domain == NSOSStatusErrorDomain,
+                      failure.code == AVAudioSession.ErrorCode.isBusy.rawValue else { throw error }
+            }
+            needsEngineRecreation = true
+            needsGraphRecovery = true
+        }
+        try session.setCategory(.playback, mode: .default, policy: .longFormAudio, options: [])
         try session.setActive(true)
+        needsSessionReset = false
+        logAudioRoute("session activated")
+        // User-initiated activation can succeed without an interruption-ended notification.
+        isInterrupted = false
+        resumeAfterInterruption = false
+    }
+
+    private func startCorePlayback() throws {
+        do {
+            try core.play()
+        } catch {
+            needsEngineRecreation = true
+            needsGraphRecovery = true
+            try core.rebuild(recreateEngine: true, resume: false)
+            try core.play()
+            needsEngineRecreation = false
+            needsGraphRecovery = false
+        }
+        logAudioRoute("playback output started")
+    }
+
+    private func logAudioRoute(_ stage: String) {
+        #if DEBUG
+        let session = AVAudioSession.sharedInstance()
+        let ports = session.currentRoute.outputs.map { $0.portType.rawValue }.joined(separator: ",")
+        print("[BMusicAudio] \(stage): route=[\(ports)] volume=\(session.outputVolume) \(core.outputDiagnostics)")
+        #endif
     }
 
     private func isCurrentPlaybackRequest(_ requestID: UUID) -> Bool {
@@ -620,12 +668,19 @@ final class NativeAudioPlayer {
             forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main
         ) { [weak self] notification in
             let reason = notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt
+            let previous = notification.userInfo?[AVAudioSessionRouteChangePreviousRouteKey] as? AVAudioSessionRouteDescription
+            let previousPorts = previous?.outputs.map { $0.portType.rawValue }.joined(separator: ",") ?? "unknown"
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                if reason == AVAudioSession.RouteChangeReason.oldDeviceUnavailable.rawValue {
+                self.logAudioRoute("route changed reason=\(reason ?? 0) previous=[\(previousPorts)]")
+                if reason == AVAudioSession.RouteChangeReason.oldDeviceUnavailable.rawValue
+                    || reason == AVAudioSession.RouteChangeReason.noSuitableRouteForCategory.rawValue {
+                    self.needsSessionReset = true
+                    self.needsEngineRecreation = true
+                    self.needsGraphRecovery = true
                     _ = self.pause()
                 } else {
-                    self.scheduleEngineRecovery(recreateEngine: false)
+                    self.scheduleEngineRecovery(recreateEngine: reason != AVAudioSession.RouteChangeReason.categoryChange.rawValue)
                 }
             }
         })
@@ -635,7 +690,7 @@ final class NativeAudioPlayer {
             let engine = notification.object as? AVAudioEngine
             Task { @MainActor [weak self] in
                 guard let self, engine === self.core.audioEngine, !self.isRebuilding else { return }
-                self.scheduleEngineRecovery(recreateEngine: false)
+                self.scheduleEngineRecovery(recreateEngine: true)
             }
         })
         sessionObservers.append(center.addObserver(
@@ -651,6 +706,7 @@ final class NativeAudioPlayer {
         guard let type, let interruption = AVAudioSession.InterruptionType(rawValue: type) else { return }
         switch interruption {
         case .began:
+            interruptionGeneration += 1
             isInterrupted = true
             needsGraphRecovery = true
             resumeAfterInterruption = wantsPlayback
@@ -661,6 +717,7 @@ final class NativeAudioPlayer {
             updateNowPlaying()
             sendState("paused")
         case .ended:
+            guard isInterrupted else { return }
             isInterrupted = false
             let shouldResume = AVAudioSession.InterruptionOptions(rawValue: options).contains(.shouldResume)
                 && resumeAfterInterruption && wantsPlayback

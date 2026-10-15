@@ -54,7 +54,7 @@ final class BMusicAudioEngine {
         sourceURL = url
         playbackVolume = volume
         lastKnownPosition = clampedPosition(startPosition)
-        configureGraph(format: file.processingFormat)
+        try configureGraph(format: file.processingFormat)
     }
 
     func setVolume(_ volume: Float) {
@@ -91,7 +91,8 @@ final class BMusicAudioEngine {
 
     func play() throws {
         guard let file = audioFile else { return }
-        if isPlaying { return }
+        if isPlaying && audioEngine.isRunning && playerNode.isPlaying { return }
+        if isPlaying { pause() }
         let frame = AVAudioFramePosition(clampedPosition(lastKnownPosition) * file.processingFormat.sampleRate)
         // Resuming at the end starts the song again; seeking to the end still ends it.
         try schedule(from: frame >= file.length ? 0 : frame)
@@ -103,6 +104,18 @@ final class BMusicAudioEngine {
         isPlaying = false
         playerNode.stop()
         audioEngine.pause()
+    }
+
+    func suspendOutput() {
+        pause()
+        audioEngine.stop()
+        audioEngine.reset()
+    }
+
+    var outputDiagnostics: String {
+        let hardware = audioEngine.outputNode.outputFormat(forBus: 0)
+        let mixer = audioEngine.mainMixerNode.outputFormat(forBus: 0)
+        return "hardware=\(hardware.sampleRate)Hz/\(hardware.channelCount)ch mixer=\(mixer.sampleRate)Hz/\(mixer.channelCount)ch running=\(audioEngine.isRunning) playerGain=\(playerNode.volume) mixerGain=\(audioEngine.mainMixerNode.outputVolume)"
     }
 
     func seek(to seconds: Double) throws {
@@ -126,6 +139,7 @@ final class BMusicAudioEngine {
         isPlaying = false
         playerNode.stop()
         audioEngine.stop()
+        audioEngine.reset()
         audioFile = nil
         sourceURL = nil
         lastKnownPosition = 0
@@ -146,7 +160,7 @@ final class BMusicAudioEngine {
         let file = try AVAudioFile(forReading: sourceURL)
         audioFile = file
         lastKnownPosition = clampedPosition(savedPosition)
-        configureGraph(format: file.processingFormat)
+        try configureGraph(format: file.processingFormat)
         if resume { try play() }
     }
 
@@ -155,12 +169,22 @@ final class BMusicAudioEngine {
         audioEngine.attach(equalizer)
     }
 
-    private func configureGraph(format: AVAudioFormat) {
+    private func configureGraph(format: AVAudioFormat) throws {
         equalizerTask?.cancel()
         audioEngine.disconnectNodeOutput(playerNode)
         audioEngine.disconnectNodeOutput(equalizer)
         audioEngine.connect(playerNode, to: equalizer, format: format)
         audioEngine.connect(equalizer, to: audioEngine.mainMixerNode, format: format)
+        if !audioEngine.isInManualRenderingMode {
+            let output = audioEngine.outputNode
+            let hardware = output.outputFormat(forBus: 0)
+            guard hardware.sampleRate > 0, hardware.channelCount > 0 else {
+                throw NSError(domain: "BMusicAudioEngine", code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "音频输出设备暂不可用，请稍后重试。"])
+            }
+            audioEngine.disconnectNodeOutput(audioEngine.mainMixerNode)
+            audioEngine.connect(audioEngine.mainMixerNode, to: output, format: hardware)
+        }
         let frequencies: [Float] = [32, 64, 125, 250, 500, 1_000, 2_000, 4_000, 8_000, 16_000]
         for (index, frequency) in frequencies.enumerated() {
             let band = equalizer.bands[index]

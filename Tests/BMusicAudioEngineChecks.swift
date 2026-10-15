@@ -24,6 +24,8 @@ struct BMusicAudioEngineChecks {
         var endedCount = 0
         core.onEnded = { endedCount += 1 }
         try core.load(url: stereoURL, volume: 1)
+        let outputConnections = engine.outputConnectionPoints(for: engine.mainMixerNode, outputBus: 0)
+        try check(outputConnections.contains { $0.node === engine.outputNode }, "Mixer is not connected to system output")
         try enableOfflineRendering(engine)
         try core.play()
         let original = try render(engine, seconds: 0.5)
@@ -75,13 +77,20 @@ struct BMusicAudioEngineChecks {
         try check(abs(core.position - beforeRebuild - 0.25) < 0.03,
                   "Recreated engine did not resume at the saved position")
 
+        let beforeUnexpectedStop = core.position
+        core.audioEngine.stop()
+        try core.play()
+        _ = try render(core.audioEngine, seconds: 0.25)
+        try check(abs(core.position - beforeUnexpectedStop - 0.25) < 0.03,
+                  "A stale playing flag prevented recovery of a stopped engine")
+
         try core.load(url: monoURL, volume: 1, startPosition: 2)
         print("Checking mono conversion and end handling")
         try core.play()
         let mono = try render(core.audioEngine, seconds: 0.5)
         await Task.yield()
         try check(mono.contains { abs($0) > 0.01 }, "Mono / sample-rate conversion produced silence")
-        try check(abs(core.position - 2.5) < 0.03, "Sample-rate conversion broke progress")
+        try check(abs(core.position - 2.5) < 0.03, "Sample-rate conversion broke progress: \(core.position)")
         try check(endedCount == 0, "Track change emitted the previous track's end event")
         _ = try render(core.audioEngine, seconds: core.duration - core.position + 0.1)
         try await Task.sleep(nanoseconds: 50_000_000)
